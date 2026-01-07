@@ -239,9 +239,28 @@ class RiskIssue(BaseModel):
     @classmethod
     def _normalize_severity(cls, v: Any) -> Any:
         if isinstance(v, str):
-            vv = v.strip().lower()
-            if vv in ("low", "medium", "high"):
-                return vv
+            vv = v.strip().lower().replace("_", " ").strip()
+            if vv.endswith(" risk"):
+                vv = vv[: -len(" risk")].strip()
+
+            mapping = {
+                "low": "low",
+                "l": "low",
+                "minor": "low",
+                "min": "low",
+                "medium": "medium",
+                "med": "medium",
+                "mid": "medium",
+                "moderate": "medium",
+                "high": "high",
+                "h": "high",
+                "major": "high",
+                "severe": "high",
+                "critical": "high",
+                "crit": "high",
+            }
+            if vv in mapping:
+                return mapping[vv]
         return v
 
 
@@ -259,9 +278,28 @@ class ClauseAssessment(BaseModel):
     @classmethod
     def _normalize_risk_level(cls, v: Any) -> Any:
         if isinstance(v, str):
-            vv = v.strip().lower()
-            if vv in ("low", "medium", "high"):
-                return vv
+            vv = v.strip().lower().replace("_", " ").strip()
+            if vv.endswith(" risk"):
+                vv = vv[: -len(" risk")].strip()
+
+            mapping = {
+                "low": "low",
+                "l": "low",
+                "minor": "low",
+                "min": "low",
+                "medium": "medium",
+                "med": "medium",
+                "mid": "medium",
+                "moderate": "medium",
+                "high": "high",
+                "h": "high",
+                "major": "high",
+                "severe": "high",
+                "critical": "high",
+                "crit": "high",
+            }
+            if vv in mapping:
+                return mapping[vv]
         return v
 
     justification: str
@@ -314,7 +352,7 @@ class RiskAssessmentStartInput(BaseModel):
 
     # RAG / policy retrieval
     policy_collection: str = "default"
-    top_k: int = Field(default=6, ge=1, le=50)
+    top_k: int = Field(default=3, ge=1, le=50)
     min_score: Optional[float] = None
     filters: Dict[str, Any] = Field(default_factory=dict)
 
@@ -541,7 +579,7 @@ MCP_TOOLS: List[Dict[str, Any]] = [
                 "parse_docx_options": {"type": "object"},
                 "parse_pdf_options": {"type": "object"},
                 "policy_collection": {"type": "string", "default": "default"},
-                "top_k": {"type": "integer", "default": 6, "minimum": 1, "maximum": 50},
+                "top_k": {"type": "integer", "default": 3, "minimum": 1, "maximum": 50},
                 "min_score": {"type": "number"},
                 "filters": {"type": "object"},
                 "model_profile": {"type": "string", "default": "assessment"},

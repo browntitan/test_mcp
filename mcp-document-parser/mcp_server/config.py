@@ -83,7 +83,7 @@ class Settings(BaseSettings):
         alias="POLICY_DB_URL",
     )
     policy_default_collection: str = Field(default="default", alias="POLICY_DEFAULT_COLLECTION")
-    policy_top_k_default: int = Field(default=6, alias="POLICY_TOP_K_DEFAULT")
+    policy_top_k_default: int = Field(default=3, alias="POLICY_TOP_K_DEFAULT")
 
     # -----------------
     # Model profiles

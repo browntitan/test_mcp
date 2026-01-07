@@ -28,7 +28,15 @@ from ...tools.parse_docx import parse_docx
 from ...tools.parse_pdf import parse_pdf
 from ...workflows.risk_assessment.store import get_store
 
+
 logger = logging.getLogger(__name__)
+
+# Prompt-size guards to reduce truncated/invalid JSON responses.
+MAX_CLAUSE_CHARS = 10000
+MAX_CLAUSE_CHARS_RETRY = 10000
+MAX_POLICY_SNIPPET_CHARS = 10000
+MAX_POLICY_BLOCK_CHARS = 10000
+MAX_POLICY_BLOCK_CHARS_RETRY = 10000
 
 
 def _infer_file_type(file_path: Optional[str], filename: Optional[str], explicit: Optional[str]) -> Optional[str]:
@@ -341,17 +349,25 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                 continue
 
             await store.set_progress(assessment_id, completed_clauses=idx - 1, current_clause_id=cid)
-
-            clause_text = _format_clause_for_assessment(clause, include_changes=include_changes)
-            if not clause_text.strip():
+            clause_text_full = _format_clause_for_assessment(clause, include_changes=include_changes)
+            if not clause_text_full.strip():
                 await store.add_warning(assessment_id, f"Empty clause text for clause_id={cid}")
                 continue
+
+            # Use a truncated version for embeddings/prompting to avoid model output truncation.
+            clause_text = clause_text_full
+            if len(clause_text) > MAX_CLAUSE_CHARS:
+                clause_text = clause_text[: MAX_CLAUSE_CHARS - 1] + "…"
+                await store.add_warning(
+                    assessment_id,
+                    f"Truncated clause_text for clause_id={cid} to {MAX_CLAUSE_CHARS} chars for assessment prompt",
+                )
 
             # Persist the exact clause text (including changes/comments) used for assessment.
             # This is used later to render per-clause reports without LLM post-processing.
             try:
                 if hasattr(store, "put_clause_text"):
-                    await store.put_clause_text(assessment_id, cid, clause_text)  # type: ignore[attr-defined]
+                    await store.put_clause_text(assessment_id, cid, clause_text_full)  # type: ignore[attr-defined]
             except Exception as e:
                 await store.add_warning(assessment_id, f"Failed to store clause text for clause_id={cid}: {e}")
 
@@ -375,45 +391,76 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                 policy_block_lines.append("Relevant internal policy excerpts (RAG):")
                 for i, c in enumerate(citations, start=1):
                     snippet = (c.text or "").strip()
-                    if len(snippet) > 1600:
-                        snippet = snippet[:1599] + "…"
+                    if len(snippet) > MAX_POLICY_SNIPPET_CHARS:
+                        snippet = snippet[: MAX_POLICY_SNIPPET_CHARS - 1] + "…"
                     policy_block_lines.append(
                         f"[{i}] policy_id={c.policy_id} chunk_id={c.chunk_id} score={c.score:.3f}\n{snippet}"
                     )
+                    # Cap total policy block size to reduce prompt bloat.
+                    if len("\n\n".join(policy_block_lines)) > MAX_POLICY_BLOCK_CHARS:
+                        policy_block_lines.append("…(additional policy excerpts omitted for length)…")
+                        break
                 policy_block = "\n\n".join(policy_block_lines)
             else:
                 policy_block = "No relevant policy context was retrieved. Use general best practices and legal reasoning."
 
-            # Ask model for a ClauseAssessment JSON
-            sys = ChatMessage(
-                role="system",
-                content=(
-                    "You are a contract risk assessment engine. You MUST output a single JSON object "
-                    "matching the required schema. Be concrete and cite provided policy excerpts when relevant. "
-                    "Do not invent citations." 
-                ),
+            # Ask model for a ClauseAssessment JSON (robust + bounded).
+            base_sys = (
+                "You are a contract risk assessment engine. "
+                "Return ONLY one valid JSON object that matches the required schema EXACTLY. "
+                "No markdown fences, no prose, no trailing text. "
+                "Enums: risk_level must be one of low|medium|high; issues[].severity must be one of low|medium|high. "
+                "Limits: issues <= 5; citations <= 5; each citations[].text <= 240 chars; keep justification concise (<= 6 sentences). "
+                "If output might be too long, shorten justification/citation snippets; NEVER output incomplete JSON."
             )
 
-            user = ChatMessage(
-                role="user",
-                content=(
-                    "Assess the following supplier Terms & Conditions clause for risk against internal policies.\n\n"
-                    "Return JSON with fields: clause_id, label, title, risk_score (0-100), risk_level (low|medium|high), "
-                    "justification, issues (list of {category, severity, description}), citations (list of {policy_id, chunk_id, score, text, metadata}), "
-                    "recommended_redline (optional).\n\n"
-                    f"Clause:\n{clause_text}\n\n"
-                    f"{policy_block}\n\n"
-                    "Rules:\n"
-                    "- risk_level: low (0-33), medium (34-66), high (67-100) unless strong rationale to adjust.\n"
-                    "- citations: Only cite from the provided RAG excerpts; copy short snippets (<= 240 chars) into citations[].text.\n"
-                    "- If no RAG excerpts apply, citations may be empty and justification should say so.\n"
-                ),
-            )
+            assessment: Optional[ClauseAssessment] = None
+            last_err: Optional[Exception] = None
 
-            try:
-                assessment = await llm.chat_object(messages=[sys, user], schema=ClauseAssessment, temperature=0.0)
-            except Exception as e:
-                await store.add_warning(assessment_id, f"Clause assessment failed for clause_id={cid}: {e}")
+            for attempt in range(2):
+                # On retry, further shrink inputs to improve JSON reliability.
+                clause_for_model = clause_text
+                policy_for_model = policy_block
+                if attempt == 1:
+                    if len(clause_for_model) > MAX_CLAUSE_CHARS_RETRY:
+                        clause_for_model = clause_for_model[: MAX_CLAUSE_CHARS_RETRY - 1] + "…"
+                    if len(policy_for_model) > MAX_POLICY_BLOCK_CHARS_RETRY:
+                        policy_for_model = policy_for_model[: MAX_POLICY_BLOCK_CHARS_RETRY - 1] + "…"
+
+                sys = ChatMessage(role="system", content=base_sys)
+
+                user = ChatMessage(
+                    role="user",
+                    content=(
+                        "Assess the following supplier Terms & Conditions clause for risk against internal policies.\n\n"
+                        "Return JSON with fields: clause_id, label, title, risk_score (0-100), risk_level (low|medium|high), "
+                        "justification, issues (list of {category, severity, description}), citations (list of {policy_id, chunk_id, score, text, metadata}), "
+                        "recommended_redline (optional).\n\n"
+                        "Hard rules:\n"
+                        "- issues[].severity must be low|medium|high (no other words).\n"
+                        "- risk_level must be low|medium|high (no other words).\n"
+                        "- citations must ONLY quote provided policy excerpts; omit citations if none apply.\n\n"
+                        f"Clause:\n{clause_for_model}\n\n"
+                        f"{policy_for_model}\n"
+                    ),
+                )
+
+                try:
+                    # Keep max_tokens bounded to reduce truncation risk.
+                    assessment = await llm.chat_object(
+                        messages=[sys, user],
+                        schema=ClauseAssessment,
+                        temperature=0.0,
+                        max_tokens=1800,
+                    )
+                    break
+                except Exception as e:
+                    last_err = e
+                    # On first failure, retry once with a smaller prompt.
+                    continue
+
+            if assessment is None:
+                await store.add_warning(assessment_id, f"Clause assessment failed for clause_id={cid}: {last_err}")
                 continue
 
             # Force stable identity fields
@@ -444,7 +491,7 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                         clause_id=cid,
                         label=assessment.label,
                         title=assessment.title,
-                        text_with_changes=clause_text,
+                        text_with_changes=clause_text_full,
                         assessment=assessment,
                     )
                     await store.put_clause_risk_result(assessment_id, rr)  # type: ignore[attr-defined]
