@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class RawSpan(BaseModel):
@@ -235,6 +235,15 @@ class RiskIssue(BaseModel):
     severity: Literal["low", "medium", "high"]
     description: str
 
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _normalize_severity(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            vv = v.strip().lower()
+            if vv in ("low", "medium", "high"):
+                return vv
+        return v
+
 
 class ClauseAssessment(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -245,6 +254,15 @@ class ClauseAssessment(BaseModel):
 
     risk_score: int = Field(ge=0, le=100)
     risk_level: Literal["low", "medium", "high"]
+
+    @field_validator("risk_level", mode="before")
+    @classmethod
+    def _normalize_risk_level(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            vv = v.strip().lower()
+            if vv in ("low", "medium", "high"):
+                return vv
+        return v
 
     justification: str
     issues: List[RiskIssue] = Field(default_factory=list)
