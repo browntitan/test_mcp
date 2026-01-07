@@ -1,0 +1,239 @@
+:root {
+  --bg: #0b0f19;
+  --panel: #121a2a;
+  --panel2: #0f1626;
+  --text: #e6edf3;
+  --muted: #a7b1c2;
+  --border: rgba(255, 255, 255, 0.10);
+  --accent: #6aa9ff;
+  --danger: #ff6b6b;
+  --ok: #4dd4ac;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  background: linear-gradient(180deg, #070a12 0%, var(--bg) 60%);
+  color: var(--text);
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 16px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 16px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 20px;
+  letter-spacing: 0.2px;
+}
+
+.subtle {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr;
+  gap: 16px;
+}
+
+.panel {
+  background: rgba(255,255,255,0.03);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 70vh;
+}
+
+.panelHeader {
+  padding: 12px 12px 10px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255,255,255,0.02);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.panelBody {
+  padding: 12px;
+  overflow: auto;
+  flex: 1;
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.05);
+  color: var(--text);
+  padding: 8px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.btn:hover { background: rgba(255,255,255,0.08); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btnPrimary {
+  border-color: rgba(106,169,255,0.5);
+  background: rgba(106,169,255,0.12);
+}
+
+.input, .select {
+  border: 1px solid var(--border);
+  background: rgba(0,0,0,0.25);
+  color: var(--text);
+  padding: 8px 10px;
+  border-radius: 10px;
+  font-size: 13px;
+  min-width: 220px;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.03);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.danger { color: var(--danger); }
+.ok { color: var(--ok); }
+
+.kvs {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 8px;
+  font-size: 13px;
+  margin-top: 8px;
+}
+
+.kvs div:nth-child(odd) { color: var(--muted); }
+
+.clauses {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.clauseItem {
+  border: 1px solid var(--border);
+  background: rgba(0,0,0,0.18);
+  border-radius: 10px;
+  padding: 10px;
+  cursor: pointer;
+}
+.clauseItem:hover { background: rgba(0,0,0,0.25); }
+.clauseItemActive {
+  border-color: rgba(106,169,255,0.7);
+  background: rgba(106,169,255,0.10);
+}
+
+.clauseTitle {
+  font-weight: 600;
+  font-size: 13px;
+  margin: 0 0 4px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.clauseMeta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.pre {
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.chatMessages {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.msg {
+  border: 1px solid var(--border);
+  background: rgba(0,0,0,0.18);
+  border-radius: 12px;
+  padding: 10px;
+}
+
+.msgUser {
+  border-color: rgba(106,169,255,0.35);
+}
+
+.msgHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.msgBody {
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.toolLine {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.footer {
+  margin-top: 18px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+@media (max-width: 980px) {
+  .grid { grid-template-columns: 1fr; }
+  .panel { min-height: 55vh; }
+}

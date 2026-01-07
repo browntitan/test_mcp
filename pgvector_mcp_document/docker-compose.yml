@@ -1,0 +1,21 @@
+services:
+  pgvector_mcp_document:
+    image: pgvector/pgvector:0.8.1-pg16-trixie
+    container_name: pgvector_mcp_document
+    environment:
+      POSTGRES_DB: pgvector_mcp_document
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"   # change to "5433:5432" if you already have Postgres on 5432
+    volumes:
+      - pgvector_mcp_document_data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pgvector_mcp_document"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgvector_mcp_document_data:

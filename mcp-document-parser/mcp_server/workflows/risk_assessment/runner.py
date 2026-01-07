@@ -1,0 +1,496 @@
+
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+from ...config import get_settings
+from ...providers.llm import ChatMessage, LLMError, get_llm
+from ...rag.pgvector import search_policies
+from ...schemas import (
+    Clause,
+    ClauseAssessment,
+    DocumentMetadata,
+    DocumentParseResult,
+    ParseDocxInput,
+    ParseDocxOptions,
+    ParsePdfInput,
+    ParsePdfOptions,
+    PolicyCitation,
+    RiskAssessmentStartInput,
+    RiskAssessmentStartOutput,
+)
+from ...tools.parse_docx import parse_docx
+from ...tools.parse_pdf import parse_pdf
+from ...workflows.risk_assessment.store import get_store
+
+logger = logging.getLogger(__name__)
+
+
+def _infer_file_type(file_path: Optional[str], filename: Optional[str], explicit: Optional[str]) -> Optional[str]:
+    if explicit:
+        e = explicit.lower().strip().lstrip(".")
+        if e in ("docx", "pdf"):
+            return e
+    name = filename or file_path or ""
+    name = name.lower()
+    if name.endswith(".docx"):
+        return "docx"
+    if name.endswith(".pdf"):
+        return "pdf"
+    return None
+
+
+def _changes_plain_text(clause: Clause) -> str:
+    """Build a plain-text Changes section for LLM consumption.
+
+    We prefer the new structured `clause.changes` field, but fall back to redlines/comments.
+    """
+
+    lines: List[str] = []
+
+    ch = getattr(clause, "changes", None)
+    has_structured = False
+    if ch is not None:
+        try:
+            has_structured = bool(ch.added or ch.deleted or ch.modified or ch.comments)
+        except Exception:
+            has_structured = False
+
+    ins = getattr(getattr(clause, "redlines", None), "insertions", []) or []
+    dele = getattr(getattr(clause, "redlines", None), "deletions", []) or []
+    comms = getattr(clause, "comments", []) or []
+
+    if has_structured:
+        lines.append("Changes:")
+        if ch.added:
+            lines.append("Added:")
+            for a in ch.added:
+                label = (a.label or "").strip() if hasattr(a, "label") else ""
+                txt = (a.text or "").strip()
+                if not txt:
+                    continue
+                lines.append(f"- {(label + ' ') if label else ''}{txt}".strip())
+            lines.append("")
+        if ch.deleted:
+            lines.append("Deleted:")
+            for d in ch.deleted:
+                label = (d.label or "").strip() if hasattr(d, "label") else ""
+                txt = (d.text or "").strip()
+                if not txt:
+                    continue
+                lines.append(f"- {(label + ' ') if label else ''}{txt}".strip())
+            lines.append("")
+        if ch.modified:
+            lines.append("Modified:")
+            for m in ch.modified:
+                label = (m.label or "").strip() if hasattr(m, "label") else ""
+                from_t = (m.from_text or "").strip()
+                to_t = (m.to_text or "").strip()
+                if not from_t and not to_t:
+                    continue
+                prefix = (label + " ") if label else ""
+                lines.append(f"- {prefix}from: {from_t} | to: {to_t}".strip())
+            lines.append("")
+        if ch.comments:
+            lines.append("Comments:")
+            for c in ch.comments:
+                author = (c.author or "Reviewer") if hasattr(c, "author") else "Reviewer"
+                anchor = (c.anchor_text or "").strip() if hasattr(c, "anchor_text") else ""
+                txt = (c.text or "").strip()
+                if not txt:
+                    continue
+                if anchor:
+                    anchor = re.sub(r"\s+", " ", anchor)
+                    lines.append(f"- {author} (anchor: \"{anchor}\"): {txt}")
+                else:
+                    lines.append(f"- {author}: {txt}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    # Fallback for older parse results
+    if not (ins or dele or comms):
+        return ""
+
+    lines.append("Changes:")
+    if ins:
+        lines.append("Added:")
+        for a in ins:
+            txt = (getattr(a, "text", "") or "").strip()
+            if txt:
+                lines.append(f"- {txt}")
+        lines.append("")
+    if dele:
+        lines.append("Deleted:")
+        for d in dele:
+            txt = (getattr(d, "text", "") or "").strip()
+            if txt:
+                lines.append(f"- {txt}")
+        lines.append("")
+    if comms:
+        lines.append("Comments:")
+        for c in comms:
+            author = getattr(c, "author", None) or "Reviewer"
+            txt = (getattr(c, "text", "") or "").strip()
+            if txt:
+                lines.append(f"- {author}: {txt}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def _format_clause_for_assessment(clause: Clause, include_changes: bool) -> str:
+    header_parts: List[str] = []
+    if clause.label:
+        header_parts.append(str(clause.label))
+    if clause.title:
+        header_parts.append(str(clause.title))
+
+    header = " ".join(header_parts).strip()
+    body = (clause.text or "").strip()
+
+    parts: List[str] = []
+    if header:
+        parts.append(header)
+    if body:
+        parts.append(body)
+
+    if include_changes:
+        changes = _changes_plain_text(clause)
+        if changes:
+            parts.append(changes)
+
+    return "\n\n".join(parts).strip()
+
+
+async def _load_or_parse(start: RiskAssessmentStartInput) -> Tuple[DocumentParseResult, List[str]]:
+    """Return (parse_result, warnings)."""
+
+    if start.parse_result is not None:
+        # Trust caller; warnings remain empty.
+        return start.parse_result, []
+
+    file_type = _infer_file_type(start.file_path, start.filename, start.file_type)
+    if not file_type:
+        raise ValueError("Unable to infer file_type (docx/pdf). Provide file_type or a file extension.")
+
+    warnings: List[str] = []
+
+    if file_type == "docx":
+        options = start.parse_docx_options or ParseDocxOptions(
+            extract_tracked_changes=True,
+            extract_comments=True,
+            include_raw_spans=True,
+        )
+        inp = ParseDocxInput(file_path=start.file_path, file_base64=start.file_base64, options=options)
+        res = parse_docx(inp)
+        warnings.extend(res.warnings)
+        return res, warnings
+
+    if file_type == "pdf":
+        options = start.parse_pdf_options or ParsePdfOptions(extract_annotations=True, include_raw_spans=True)
+        inp = ParsePdfInput(file_path=start.file_path, file_base64=start.file_base64, options=options)
+        res = parse_pdf(inp)
+        warnings.extend(res.warnings)
+        return res, warnings
+
+    raise ValueError(f"Unsupported file_type: {file_type}")
+
+
+async def start_risk_assessment(start: RiskAssessmentStartInput) -> RiskAssessmentStartOutput:
+    """Start a risk assessment.
+
+    - If mode == 'async', schedules background execution and returns immediately.
+    - If mode == 'sync', runs to completion before returning.
+
+    Note: This function is intended to be called from the MCP tool handler.
+    """
+
+    settings = get_settings()
+    store = get_store()
+
+    parse_result, warnings = await _load_or_parse(start)
+
+    clause_ids_all = [c.clause_id for c in parse_result.clauses]
+    focus_clause_ids = start.focus_clause_ids
+    if focus_clause_ids:
+        focus_set = set(focus_clause_ids)
+        clause_ids = [cid for cid in clause_ids_all if cid in focus_set]
+    else:
+        clause_ids = clause_ids_all
+
+    meta = parse_result.document
+    assessment_id = await store.create(
+        document=meta.model_dump(mode="json"),
+        clause_ids=clause_ids,
+        warnings=warnings,
+        status="queued" if start.mode == "async" else "running",
+    )
+
+    if start.mode == "async":
+        task = asyncio.create_task(_run_assessment(assessment_id, parse_result, start))
+
+        def _done(t: asyncio.Task) -> None:
+            try:
+                exc = t.exception()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.exception("risk_assessment task introspection failed (assessment_id=%s): %s", assessment_id, e)
+                return
+            if exc:
+                logger.exception("risk_assessment task crashed (assessment_id=%s): %s", assessment_id, exc)
+
+        task.add_done_callback(_done)
+
+        return RiskAssessmentStartOutput(
+            assessment_id=assessment_id,
+            status="queued",
+            document=meta,
+            clause_count=len(clause_ids),
+            warnings=warnings,
+        )
+
+    # sync
+    await _run_assessment(assessment_id, parse_result, start)
+    rec = await store.get(assessment_id)
+    status = rec.status if rec else "failed"
+    return RiskAssessmentStartOutput(
+        assessment_id=assessment_id,
+        status=status if status in ("completed", "failed") else "completed",
+        document=meta,
+        clause_count=len(clause_ids),
+        warnings=warnings,
+    )
+
+
+async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult, start: RiskAssessmentStartInput) -> None:
+    """Execute the deterministic clause-by-clause risk assessment."""
+
+    store = get_store()
+
+    settings = get_settings()
+
+    # Use a dedicated model profile for embeddings so we can decouple:
+    # - chat/assessment LLM (for reasoning)
+    # - embeddings model/provider (for pgvector retrieval)
+    embeddings_profile = getattr(settings, "embeddings_model_profile", None) or start.model_profile
+
+    try:
+        llm = get_llm(start.model_profile)
+        embed_llm = get_llm(embeddings_profile)
+
+        # One-time embedding health check to fail fast if the embedding model/config is wrong.
+        probe = await embed_llm.embed_texts("dimension check")
+        if not probe or not probe[0]:
+            raise LLMError("Embeddings endpoint returned no vectors")
+        dim = len(probe[0])
+        expected_dim = getattr(settings, "embeddings_dim", None)
+        if expected_dim and dim != int(expected_dim):
+            raise LLMError(
+                f"Embedding dimension mismatch: got {dim}, expected {int(expected_dim)}. "
+                "Update EMBEDDINGS_DIM and/or your embedding model selection."
+            )
+
+        await store.set_status(assessment_id, "running")
+        logger.info(
+            "risk_assessment running (assessment_id=%s, clauses=%s, model_profile=%s, embeddings_profile=%s)",
+            assessment_id,
+            len(parse_result.clauses),
+            start.model_profile,
+            embeddings_profile,
+        )
+
+        # Resolve clauses
+        clause_map: Dict[str, Clause] = {c.clause_id: c for c in parse_result.clauses}
+        clause_order = [c.clause_id for c in parse_result.clauses]
+        if start.focus_clause_ids:
+            focus = set(start.focus_clause_ids)
+            clause_order = [cid for cid in clause_order if cid in focus]
+
+        total = len(clause_order)
+        await store.set_progress(assessment_id, completed_clauses=0, current_clause_id=None)
+
+        # Embedder for retrieval: embed a single string -> vector
+        async def embed_query(q: str) -> List[float]:
+            embs = await embed_llm.embed_texts(q)
+            if not embs or not embs[0]:
+                raise LLMError("Embeddings endpoint returned no vectors")
+            return embs[0]
+
+        include_changes = bool(start.include_text_with_changes)
+
+        results: List[ClauseAssessment] = []
+
+        # Deterministic order: we iterate in clause_order. (Concurrency can be added later.)
+        for idx, cid in enumerate(clause_order, start=1):
+            rec = await store.get(assessment_id)
+            if rec is None:
+                raise RuntimeError("Assessment record disappeared")
+            if rec.status == "canceled":
+                await store.set_status(assessment_id, "canceled")
+                return
+
+            clause = clause_map.get(cid)
+            if clause is None:
+                await store.add_warning(assessment_id, f"Clause id not found in parse_result: {cid}")
+                continue
+
+            await store.set_progress(assessment_id, completed_clauses=idx - 1, current_clause_id=cid)
+
+            clause_text = _format_clause_for_assessment(clause, include_changes=include_changes)
+            if not clause_text.strip():
+                await store.add_warning(assessment_id, f"Empty clause text for clause_id={cid}")
+                continue
+
+            # Retrieve policy context via pgvector
+            citations: List[PolicyCitation] = []
+            try:
+                citations = await search_policies(
+                    clause_text,
+                    collection=start.policy_collection,
+                    top_k=start.top_k,
+                    min_score=start.min_score,
+                    filters=start.filters,
+                    embedder=embed_query,
+                )
+            except Exception as e:
+                await store.add_warning(assessment_id, f"Policy retrieval failed for clause_id={cid}: {e}")
+                citations = []
+
+            policy_block_lines: List[str] = []
+            if citations:
+                policy_block_lines.append("Relevant internal policy excerpts (RAG):")
+                for i, c in enumerate(citations, start=1):
+                    snippet = (c.text or "").strip()
+                    if len(snippet) > 1600:
+                        snippet = snippet[:1599] + "…"
+                    policy_block_lines.append(
+                        f"[{i}] policy_id={c.policy_id} chunk_id={c.chunk_id} score={c.score:.3f}\n{snippet}"
+                    )
+                policy_block = "\n\n".join(policy_block_lines)
+            else:
+                policy_block = "No relevant policy context was retrieved. Use general best practices and legal reasoning."
+
+            # Ask model for a ClauseAssessment JSON
+            sys = ChatMessage(
+                role="system",
+                content=(
+                    "You are a contract risk assessment engine. You MUST output a single JSON object "
+                    "matching the required schema. Be concrete and cite provided policy excerpts when relevant. "
+                    "Do not invent citations." 
+                ),
+            )
+
+            user = ChatMessage(
+                role="user",
+                content=(
+                    "Assess the following supplier Terms & Conditions clause for risk against internal policies.\n\n"
+                    "Return JSON with fields: clause_id, label, title, risk_score (0-100), risk_level (low|medium|high), "
+                    "justification, issues (list of {category, severity, description}), citations (list of {policy_id, chunk_id, score, text, metadata}), "
+                    "recommended_redline (optional).\n\n"
+                    f"Clause:\n{clause_text}\n\n"
+                    f"{policy_block}\n\n"
+                    "Rules:\n"
+                    "- risk_level: low (0-33), medium (34-66), high (67-100) unless strong rationale to adjust.\n"
+                    "- citations: Only cite from the provided RAG excerpts; copy short snippets (<= 240 chars) into citations[].text.\n"
+                    "- If no RAG excerpts apply, citations may be empty and justification should say so.\n"
+                ),
+            )
+
+            try:
+                assessment = await llm.chat_object(messages=[sys, user], schema=ClauseAssessment, temperature=0.0)
+            except Exception as e:
+                await store.add_warning(assessment_id, f"Clause assessment failed for clause_id={cid}: {e}")
+                continue
+
+            # Force stable identity fields
+            if assessment.clause_id != cid:
+                assessment = assessment.model_copy(update={"clause_id": cid})
+            if not assessment.label and clause.label:
+                assessment = assessment.model_copy(update={"label": str(clause.label)})
+            if not assessment.title and clause.title:
+                assessment = assessment.model_copy(update={"title": str(clause.title)})
+
+            # If model returned citations, ensure they are bounded (avoid huge payloads)
+            bounded_cits: List[PolicyCitation] = []
+            for c in assessment.citations[: max(0, min(20, len(assessment.citations)))]:
+                txt = (c.text or "").strip()
+                if len(txt) > 300:
+                    c = c.model_copy(update={"text": txt[:299] + "…"})
+                bounded_cits.append(c)
+            if assessment.citations != bounded_cits:
+                assessment = assessment.model_copy(update={"citations": bounded_cits})
+
+            await store.put_clause_result(assessment_id, assessment)
+            results.append(assessment)
+
+            await store.set_progress(assessment_id, completed_clauses=idx, current_clause_id=cid)
+
+        # Totals + summary
+        totals: Dict[str, Any] = {
+            "total": len(results),
+            "low": sum(1 for r in results if r.risk_level == "low"),
+            "medium": sum(1 for r in results if r.risk_level == "medium"),
+            "high": sum(1 for r in results if r.risk_level == "high"),
+            "avg_score": (sum(r.risk_score for r in results) / len(results)) if results else 0,
+        }
+
+        # Prepare a compact summary prompt
+        top_high = sorted([r for r in results if r.risk_level == "high"], key=lambda x: x.risk_score, reverse=True)[:8]
+        top_med = sorted([r for r in results if r.risk_level == "medium"], key=lambda x: x.risk_score, reverse=True)[:6]
+
+        lines: List[str] = []
+        lines.append(f"Document: {parse_result.document.filename}")
+        lines.append(f"Totals: {totals}")
+        if top_high:
+            lines.append("Top High Risk Clauses:")
+            for r in top_high:
+                lines.append(f"- {r.label or r.clause_id} {r.title or ''} (score={r.risk_score}): {r.justification[:280]}")
+        if top_med:
+            lines.append("Top Medium Risk Clauses:")
+            for r in top_med:
+                lines.append(f"- {r.label or r.clause_id} {r.title or ''} (score={r.risk_score}): {r.justification[:240]}")
+
+        summary_seed = "\n".join(lines).strip()
+
+        summary_text = ""
+        try:
+            summary_text = await llm.chat_text(
+                messages=[
+                    ChatMessage(
+                        role="system",
+                        content=(
+                            "You are summarizing a clause-by-clause contract risk assessment for a busy stakeholder. "
+                            "Produce a concise executive summary, key themes, and recommended next steps."
+                        ),
+                    ),
+                    ChatMessage(role="user", content=summary_seed),
+                ],
+                temperature=0.2,
+                max_tokens=900,
+            )
+        except Exception:
+            # Deterministic fallback
+            summary_text = (
+                f"Risk assessment complete. High={totals['high']}, Medium={totals['medium']}, Low={totals['low']}. "
+                f"Average score={totals['avg_score']:.1f}."
+            )
+
+        await store.set_report(assessment_id, summary=summary_text, totals=totals)
+
+        # If canceled during finalization, respect it
+        rec2 = await store.get(assessment_id)
+        if rec2 is not None and rec2.status == "canceled":
+            await store.set_status(assessment_id, "canceled")
+            return
+
+        await store.set_status(assessment_id, "completed")
+
+    except Exception as e:
+        await store.set_status(assessment_id, "failed", error=str(e))
+        await store.add_warning(assessment_id, f"Assessment failed: {e}")
+        return
