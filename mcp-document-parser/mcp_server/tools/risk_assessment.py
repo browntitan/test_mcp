@@ -1,6 +1,3 @@
-
-
-
 from __future__ import annotations
 
 import logging
@@ -31,14 +28,89 @@ def _not_found(name: str, assessment_id: str) -> ValueError:
     return ValueError(f"{name}: assessment_id not found: {assessment_id}")
 
 
-def _compute_totals(results: List[ClauseAssessment]) -> Dict[str, Any]:
+
+def _as_assessment(item: Any) -> ClauseAssessment:
+    """Back-compat: accept either ClauseAssessment or an object/dict with an `assessment` field."""
+    if item is None:
+        raise ValueError("Missing clause result item")
+
+    # dict-like
+    if isinstance(item, dict) and "assessment" in item:
+        return ClauseAssessment.model_validate(item["assessment"])
+
+    # object-like
+    if hasattr(item, "assessment"):
+        return getattr(item, "assessment")
+
+    # already a ClauseAssessment
+    return item
+
+
+def _get_text_with_changes(item: Any) -> Optional[str]:
+    # dict-like
+    if isinstance(item, dict):
+        v = item.get("text_with_changes") or item.get("clause_text") or item.get("text")
+        return (v or None)
+    # object-like
+    for attr in ("text_with_changes", "clause_text", "text"):
+        if hasattr(item, attr):
+            v = getattr(item, attr)
+            if isinstance(v, str) and v.strip():
+                return v
+    return None
+
+
+def _get_item_label_title(item: Any) -> tuple[Optional[str], Optional[str]]:
+    """Extract label/title from a rich item if present (e.g., ClauseRiskResult), else None."""
+    # dict-like
+    if isinstance(item, dict):
+        lbl = item.get("label")
+        ttl = item.get("title")
+        return (lbl if isinstance(lbl, str) else None, ttl if isinstance(ttl, str) else None)
+
+    # object-like
+    lbl = getattr(item, "label", None)
+    ttl = getattr(item, "title", None)
+    return (lbl if isinstance(lbl, str) else None, ttl if isinstance(ttl, str) else None)
+
+
+def _make_clause_header(item: Any, r: ClauseAssessment) -> str:
+    """Prefer label/title on the rich item; fall back to the assessment; then clause_id."""
+    item_label, item_title = _get_item_label_title(item)
+
+    parts: List[str] = []
+    for v in (
+        (item_label or "").strip(),
+        (item_title or "").strip(),
+        (getattr(r, "label", None) or "").strip(),
+        (getattr(r, "title", None) or "").strip(),
+    ):
+        if v and v not in parts:
+            parts.append(v)
+
+    header = " ".join([p for p in parts if p]).strip()
+    return header or (getattr(r, "clause_id", None) or "(unknown clause)")
+
+
+def _compute_totals(results: List[Any]) -> Dict[str, Any]:
     if not results:
         return {"total": 0, "low": 0, "medium": 0, "high": 0, "avg_score": 0}
-    total = len(results)
-    low = sum(1 for r in results if r.risk_level == "low")
-    medium = sum(1 for r in results if r.risk_level == "medium")
-    high = sum(1 for r in results if r.risk_level == "high")
-    avg = sum(r.risk_score for r in results) / total
+
+    assessments: List[ClauseAssessment] = []
+    for it in results:
+        try:
+            assessments.append(_as_assessment(it))
+        except Exception:
+            continue
+
+    if not assessments:
+        return {"total": 0, "low": 0, "medium": 0, "high": 0, "avg_score": 0}
+
+    total = len(assessments)
+    low = sum(1 for r in assessments if r.risk_level == "low")
+    medium = sum(1 for r in assessments if r.risk_level == "medium")
+    high = sum(1 for r in assessments if r.risk_level == "high")
+    avg = sum(r.risk_score for r in assessments) / total
     return {"total": total, "low": low, "medium": medium, "high": high, "avg_score": avg}
 
 
@@ -68,33 +140,66 @@ def _render_report_markdown(report: RiskAssessmentReportOutput) -> str:
     lines.append("## Clause Results")
     lines.append("")
 
-    for r in report.clause_results:
-        header = " ".join([p for p in [r.label or "", r.title or ""] if p]).strip()
-        header = header or r.clause_id
+    for item in report.clause_results:
+        r = _as_assessment(item)
+        clause_text = _get_text_with_changes(item)
+
+        header = _make_clause_header(item, r)
+
+        # If the stored clause text already begins with the same header line, drop it to avoid duplication.
+        if clause_text:
+            first_line = clause_text.strip().splitlines()[0].strip() if clause_text.strip() else ""
+            if first_line and first_line == header:
+                clause_text = "\n".join(clause_text.splitlines()[1:]).lstrip("\n").strip() or None
+
         lines.append(f"### {header}")
         lines.append("")
+
+        if clause_text:
+            lines.append("**Clause text (including changes/comments if available):**")
+            lines.append("")
+            lines.append("```text")
+            lines.append(clause_text.strip())
+            lines.append("```")
+            lines.append("")
+
         lines.append(f"- Risk: **{r.risk_level.upper()}** (score={r.risk_score})")
+        lines.append("")
+
+        if r.justification:
+            lines.append("**Justification:**")
+            lines.append("")
+            lines.append(r.justification.strip())
+            lines.append("")
+
         if r.issues:
-            lines.append("- Issues:")
+            lines.append("**Issues:**")
+            lines.append("")
             for it in r.issues:
-                lines.append(f"  - [{it.severity}] {it.category}: {it.description}")
+                lines.append(f"- [{it.severity}] {it.category}: {it.description}")
+            lines.append("")
+
         if r.citations:
-            lines.append("- Policy citations:")
+            lines.append("**Policy citations:**")
+            lines.append("")
             for c in r.citations:
                 snippet = (c.text or "").strip().replace("\n", " ")
                 if len(snippet) > 260:
                     snippet = snippet[:259] + "…"
                 lines.append(
-                    f"  - policy_id={c.policy_id} chunk_id={c.chunk_id} score={c.score:.3f}: {snippet}"
+                    f"- policy_id={c.policy_id} chunk_id={c.chunk_id} score={c.score:.3f}: {snippet}"
                 )
+            lines.append("")
+
         if r.recommended_redline:
-            lines.append("- Recommended redline:")
+            lines.append("**Recommended redline:**")
             lines.append("")
             lines.append("```text")
             lines.append(r.recommended_redline.strip())
             lines.append("```")
-        lines.append("")
-        lines.append(r.justification.strip() if r.justification else "")
+            lines.append("")
+
+        lines.append("---")
         lines.append("")
 
     return "\n".join(lines).strip() + "\n"

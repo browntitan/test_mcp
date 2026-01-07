@@ -302,6 +302,71 @@ function formatClauseForLLM(c: Clause) {
   return parts.join('\n').trim();
 }
 
+type ClauseItem = {
+  clause_id: string | null;
+  label: string | null;
+  title: string | null;
+  header: string;
+  text_with_changes: string | null;
+  risk_level: string | null;
+  risk_score: number | null;
+  justification: string | null;
+  issues: any[];
+  citations: any[];
+  recommended_redline: string | null;
+};
+
+function extractClauseItemsFromReport(report: any): ClauseItem[] {
+  const results = Array.isArray(report?.clause_results) ? report.clause_results : [];
+
+  return results.map((item: any) => {
+    const assessment = item?.assessment ?? item;
+
+    const clause_id =
+      (assessment?.clause_id ?? item?.clause_id ?? null) !== undefined
+        ? String(assessment?.clause_id ?? item?.clause_id)
+        : null;
+
+    const labelRaw = item?.label ?? assessment?.label ?? null;
+    const titleRaw = item?.title ?? assessment?.title ?? null;
+
+    const label = typeof labelRaw === 'string' ? labelRaw : labelRaw != null ? String(labelRaw) : null;
+    const title = typeof titleRaw === 'string' ? titleRaw : titleRaw != null ? String(titleRaw) : null;
+
+    const header = [label, title].filter(Boolean).join(' ').trim() || clause_id || '(unknown clause)';
+
+    const text_with_changes =
+      typeof item?.text_with_changes === 'string' && item.text_with_changes.trim()
+        ? item.text_with_changes
+        : null;
+
+    const risk_level = typeof assessment?.risk_level === 'string' ? assessment.risk_level : null;
+    const risk_score = Number.isFinite(assessment?.risk_score) ? Number(assessment.risk_score) : null;
+    const justification = typeof assessment?.justification === 'string' ? assessment.justification : null;
+
+    const issues = Array.isArray(assessment?.issues) ? assessment.issues : [];
+    const citations = Array.isArray(assessment?.citations) ? assessment.citations : [];
+    const recommended_redline =
+      typeof assessment?.recommended_redline === 'string' && assessment.recommended_redline.trim()
+        ? assessment.recommended_redline
+        : null;
+
+    return {
+      clause_id,
+      label,
+      title,
+      header,
+      text_with_changes,
+      risk_level,
+      risk_score,
+      justification,
+      issues,
+      citations,
+      recommended_redline,
+    };
+  });
+}
+
 function zodFromJsonSchemaLoose(_schema: any) {
   // Full JSON Schema -> Zod conversion is overkill here.
   // We accept any args object and let the MCP server validate.
@@ -475,7 +540,7 @@ export async function POST(req: Request) {
         top_k: z.number().int().min(1).max(50).default(6),
         min_score: z.number().optional(),
         model_profile: z.enum(['chat', 'assessment']).default('assessment'),
-        mode: z.enum(['sync', 'async']).default('async'),
+        mode: z.enum(['sync', 'async']).optional(),
         format: z.enum(['json', 'markdown']).default('markdown'),
         wait_for_completion: z.boolean().default(true),
         max_wait_ms: z.number().int().min(1000).max(55_000).default(45_000),
@@ -484,6 +549,19 @@ export async function POST(req: Request) {
       execute: async (args: any) => {
         const parseResult: any = data;
 
+        const clauseCount = Array.isArray((parseResult as any)?.clauses) ? (parseResult as any).clauses.length : null;
+
+        const waitForCompletion = args?.wait_for_completion !== false; // default true
+        const maxWaitMs = Number.isFinite(args?.max_wait_ms) ? Number(args.max_wait_ms) : 45_000;
+        const pollIntervalMs = Number.isFinite(args?.poll_interval_ms) ? Number(args.poll_interval_ms) : 750;
+
+        // If the caller didn't specify a mode, pick one.
+        // For small docs and when the user wants the final report now, prefer sync to finish in one request.
+        let effectiveMode: 'sync' | 'async' = (args?.mode as any) || 'async';
+        if (!args?.mode && waitForCompletion && typeof clauseCount === 'number' && clauseCount > 0 && clauseCount <= 12) {
+          effectiveMode = 'sync';
+        }
+
         const startPayload: any = {
           parse_result: parseResult,
           policy_collection: args?.policy_collection ?? 'default',
@@ -491,7 +569,7 @@ export async function POST(req: Request) {
           min_score: args?.min_score,
           model_profile: args?.model_profile ?? 'assessment',
           include_text_with_changes: true,
-          mode: args?.mode ?? 'async',
+          mode: effectiveMode,
         };
 
         const started = await mcpCallTool('risk_assessment.start', startPayload);
@@ -510,15 +588,11 @@ export async function POST(req: Request) {
           return { error: 'risk_assessment.start did not return assessment_id', started };
         }
 
-        const waitForCompletion = args?.wait_for_completion !== false; // default true
-        const maxWaitMs = Number.isFinite(args?.max_wait_ms) ? Number(args.max_wait_ms) : 45_000;
-        const pollIntervalMs = Number.isFinite(args?.poll_interval_ms) ? Number(args.poll_interval_ms) : 750;
-
         let status_output: any = null;
         let final_status: any = status;
 
         // If async, optionally poll until completion so the user gets the final report in one tool call.
-        if (assessment_id && waitForCompletion && status && status !== 'completed') {
+        if (assessment_id && effectiveMode === 'async' && waitForCompletion && status && status !== 'completed') {
           const deadline = Date.now() + Math.min(Math.max(maxWaitMs, 1000), 55_000);
           while (Date.now() < deadline) {
             await sleepMs(pollIntervalMs);
@@ -535,28 +609,50 @@ export async function POST(req: Request) {
           }
         }
 
-        // If completed (either sync or after polling), fetch the report now.
-        let report: any = null;
+        // Fetch a JSON report snapshot once we have an assessment_id.
+        // Even if the job is still running, the server can return partial clause_results.
+        let report: any = null; // JSON report
         let report_markdown: string | null = null;
-        if (assessment_id && (final_status === 'completed' || status === 'completed')) {
-          report = await mcpCallTool('risk_assessment.report', {
-            assessment_id,
-            format: args?.format ?? 'markdown',
-          });
-          if (report && typeof (report as any).summary === 'string') {
-            report_markdown = (report as any).summary;
+        let report_error: string | null = null;
+
+        if (assessment_id) {
+          try {
+            // Always fetch JSON so the UI can render per-clause items.
+            report = await mcpCallTool('risk_assessment.report', {
+              assessment_id,
+              format: 'json',
+            });
+
+            // Optionally fetch markdown too (for easy display/debugging).
+            const wantMarkdown = (args?.format ?? 'markdown') === 'markdown';
+            if (wantMarkdown) {
+              const md = await mcpCallTool('risk_assessment.report', {
+                assessment_id,
+                format: 'markdown',
+              });
+              if (md && typeof (md as any).summary === 'string') {
+                report_markdown = (md as any).summary;
+              }
+            }
+          } catch (e: any) {
+            report_error = e?.message || String(e);
           }
         }
+
+        const clause_items = report ? extractClauseItemsFromReport(report) : [];
 
         return {
           docId,
           assessment_id,
           status,
+          effectiveMode,
           final_status,
           status_output,
           started,
           report,
+          clause_items,
           report_markdown,
+          report_error,
           note:
             (final_status ?? status) !== 'completed'
               ? 'Assessment started but not completed within this request. Use get_risk_assessment_status to poll and get_risk_assessment_report to fetch the final report using assessment_id.'
@@ -593,12 +689,21 @@ export async function POST(req: Request) {
       }),
       execute: async ({ assessment_id, format }) => {
         try {
-          const report = await mcpCallTool('risk_assessment.report', { assessment_id, format });
+          // Always fetch JSON for structured clause_items
+          const report = await mcpCallTool('risk_assessment.report', { assessment_id, format: 'json' });
           if (report && typeof report === 'object' && (report as any).error) {
             return { error: 'risk_assessment.report returned an error', report };
           }
-          const report_markdown = report && typeof (report as any).summary === 'string' ? (report as any).summary : null;
-          return { assessment_id, report, report_markdown };
+
+          const clause_items = extractClauseItemsFromReport(report);
+
+          let report_markdown: string | null = null;
+          if ((format ?? 'markdown') === 'markdown') {
+            const md = await mcpCallTool('risk_assessment.report', { assessment_id, format: 'markdown' });
+            report_markdown = md && typeof (md as any).summary === 'string' ? (md as any).summary : null;
+          }
+
+          return { assessment_id, report, clause_items, report_markdown };
         } catch (e: any) {
           return { error: e?.message || String(e) };
         }
@@ -646,7 +751,7 @@ export async function POST(req: Request) {
     `You are a legal document analysis assistant.`,
     `The user is chatting about ONE parsed document.`,
     `Use the available tools to inspect the document clause-by-clause (don't guess).`,
-    `If the user asks for a risk assessment, call run_risk_assessment (no docId needed). Prefer wait_for_completion=true so it returns the final report_markdown in one call when possible.`,
+    `If the user asks for a risk assessment, call run_risk_assessment (no docId needed). Prefer wait_for_completion=true; it returns report (JSON) + clause_items (per-clause results) and often report_markdown.`,
     `If run_risk_assessment returns an assessment_id but final_status is not completed, use get_risk_assessment_status and then get_risk_assessment_report with that assessment_id.`,
     `After calling tools, ALWAYS write a final plain-text answer for the user.`,
     ``,

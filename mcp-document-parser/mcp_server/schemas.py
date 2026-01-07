@@ -268,7 +268,29 @@ class ClauseAssessment(BaseModel):
     issues: List[RiskIssue] = Field(default_factory=list)
     citations: List[PolicyCitation] = Field(default_factory=list)
 
+
     recommended_redline: Optional[str] = None
+
+
+# New richer per-clause result model that includes the clause text used for assessment
+class ClauseRiskResult(BaseModel):
+    """Richer per-clause result that includes the clause text used for assessment.
+
+    This supports the UI format you want (clause text + changes/comments + risk + justification)
+    while keeping backwards compatibility with older clients that expect ClauseAssessment only.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    clause_id: str
+    label: Optional[str] = None
+    title: Optional[str] = None
+
+    # The full clause text that was assessed, optionally including a "Changes:" block.
+    text_with_changes: Optional[str] = None
+
+    # The structured assessment output.
+    assessment: ClauseAssessment
 
 
 class RiskAssessmentStartInput(BaseModel):
@@ -365,7 +387,7 @@ class RiskAssessmentGetClauseResultOutput(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     assessment_id: str
-    clause: ClauseAssessment
+    clause: Union[ClauseAssessment, ClauseRiskResult]
 
 
 class RiskAssessmentReportInput(BaseModel):
@@ -382,7 +404,7 @@ class RiskAssessmentReportOutput(BaseModel):
     status: Literal["queued", "running", "completed", "failed", "canceled"]
 
     summary: str
-    clause_results: List[ClauseAssessment] = Field(default_factory=list)
+    clause_results: List[Union[ClauseAssessment, ClauseRiskResult]] = Field(default_factory=list)
     totals: Dict[str, Any] = Field(default_factory=dict)
 
 

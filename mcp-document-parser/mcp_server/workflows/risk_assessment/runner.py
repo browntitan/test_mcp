@@ -13,6 +13,7 @@ from ...rag.pgvector import search_policies
 from ...schemas import (
     Clause,
     ClauseAssessment,
+    ClauseRiskResult,
     DocumentMetadata,
     DocumentParseResult,
     ParseDocxInput,
@@ -346,6 +347,14 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                 await store.add_warning(assessment_id, f"Empty clause text for clause_id={cid}")
                 continue
 
+            # Persist the exact clause text (including changes/comments) used for assessment.
+            # This is used later to render per-clause reports without LLM post-processing.
+            try:
+                if hasattr(store, "put_clause_text"):
+                    await store.put_clause_text(assessment_id, cid, clause_text)  # type: ignore[attr-defined]
+            except Exception as e:
+                await store.add_warning(assessment_id, f"Failed to store clause text for clause_id={cid}: {e}")
+
             # Retrieve policy context via pgvector
             citations: List[PolicyCitation] = []
             try:
@@ -425,10 +434,32 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
             if assessment.citations != bounded_cits:
                 assessment = assessment.model_copy(update={"citations": bounded_cits})
 
+            # Backward-compatible storage (existing clients): ClauseAssessment only
             await store.put_clause_result(assessment_id, assessment)
+
+            # New richer storage (new clients): include the assessed clause text + structured assessment
+            try:
+                if hasattr(store, "put_clause_risk_result"):
+                    rr = ClauseRiskResult(
+                        clause_id=cid,
+                        label=assessment.label,
+                        title=assessment.title,
+                        text_with_changes=clause_text,
+                        assessment=assessment,
+                    )
+                    await store.put_clause_risk_result(assessment_id, rr)  # type: ignore[attr-defined]
+            except Exception as e:
+                await store.add_warning(assessment_id, f"Failed to store ClauseRiskResult for clause_id={cid}: {e}")
+
             results.append(assessment)
 
             await store.set_progress(assessment_id, completed_clauses=idx, current_clause_id=cid)
+
+        # Clear current clause pointer now that iteration is finished.
+        try:
+            await store.set_progress(assessment_id, current_clause_id=None)
+        except Exception:
+            pass
 
         # Totals + summary
         totals: Dict[str, Any] = {

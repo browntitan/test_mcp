@@ -18,6 +18,155 @@ type ParseOptions =
       include_raw_spans?: boolean;
     };
 
+// -------------------------
+// Risk report rendering
+// -------------------------
+
+type ClauseItem = {
+  clause_id: string | null;
+  label: string | null;
+  title: string | null;
+  header: string;
+  text_with_changes: string | null;
+  risk_level: string | null;
+  risk_score: number | null;
+  justification: string | null;
+  issues: any[];
+  citations: any[];
+  recommended_redline: string | null;
+};
+
+function isClauseItems(x: any): x is ClauseItem[] {
+  return Array.isArray(x) && x.every(it => it && typeof it === 'object' && typeof it.header === 'string');
+}
+
+function RiskClauseItemsView({ items }: { items: ClauseItem[] }) {
+  if (!items.length) return null;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ fontWeight: 600 }}>Clause-by-clause risk results</div>
+
+      {items.map((it, idx) => {
+        const risk = (it.risk_level || 'unknown').toUpperCase();
+        const score = typeof it.risk_score === 'number' ? it.risk_score : null;
+
+        return (
+          <div
+            key={it.clause_id || String(idx)}
+            style={{
+              border: '1px solid rgba(255,255,255,0.15)',
+              borderRadius: 8,
+              padding: 12,
+              overflow: 'hidden',
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'baseline' }}>
+              <div style={{ fontWeight: 600 }}>{it.header}</div>
+              <div
+                style={{
+                  fontFamily:
+                    'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+                }}
+              >
+                Risk: {risk}
+                {score !== null ? ` (score=${score})` : ''}
+              </div>
+            </div>
+
+            {it.text_with_changes ? (
+              <pre
+                style={{
+                  marginTop: 10,
+                  whiteSpace: 'pre-wrap',
+                  fontSize: 12,
+                  lineHeight: 1.35,
+                  padding: 10,
+                  borderRadius: 6,
+                  background: 'rgba(255,255,255,0.06)',
+                }}
+              >
+                {it.text_with_changes}
+              </pre>
+            ) : null}
+
+            {it.justification ? (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>Justification</div>
+                <div style={{ whiteSpace: 'pre-wrap' }}>{it.justification}</div>
+              </div>
+            ) : null}
+
+            {Array.isArray(it.issues) && it.issues.length ? (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>Issues</div>
+                <ul style={{ margin: 0, paddingLeft: 18 }}>
+                  {it.issues.slice(0, 20).map((iss: any, j: number) => (
+                    <li key={j}>
+                      <span
+                        style={{
+                          fontFamily:
+                            'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+                        }}
+                      >
+                        [{String(iss?.severity || '').toLowerCase()}]
+                      </span>{' '}
+                      {iss?.category ? `${iss.category}: ` : ''}
+                      {iss?.description || ''}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+
+            {Array.isArray(it.citations) && it.citations.length ? (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>Policy citations</div>
+                <ul style={{ margin: 0, paddingLeft: 18 }}>
+                  {it.citations.slice(0, 20).map((c: any, j: number) => {
+                    const meta =
+                      `${c?.policy_id ? `policy_id=${c.policy_id}` : ''}` +
+                      `${c?.chunk_id ? ` chunk_id=${c.chunk_id}` : ''}` +
+                      `${typeof c?.score === 'number' ? ` score=${Number(c.score).toFixed(3)}` : ''}`;
+
+                    const snippet =
+                      c?.text ? ` — ${String(c.text).replace(/\s+/g, ' ').trim().slice(0, 260)}` : '';
+
+                    return (
+                      <li key={j}>
+                        <span className="mono">{meta.trim()}</span>
+                        {snippet}
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            ) : null}
+
+            {it.recommended_redline ? (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>Recommended redline</div>
+                <pre
+                  style={{
+                    whiteSpace: 'pre-wrap',
+                    fontSize: 12,
+                    lineHeight: 1.35,
+                    padding: 10,
+                    borderRadius: 6,
+                    background: 'rgba(255,255,255,0.06)',
+                  }}
+                >
+                  {it.recommended_redline}
+                </pre>
+              </div>
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function inferIsPdf(filename: string, mime?: string) {
   if (mime?.toLowerCase() === 'application/pdf') return true;
   return filename.toLowerCase().endsWith('.pdf');
@@ -59,25 +208,33 @@ function renderMessageParts(m: any) {
       );
       continue;
     }
-      // Hide step bookkeeping parts (AI SDK emits these during multi-step runs)
-      if (p?.type === 'step-start' || p?.type === 'step-finish' || p?.type === 'step') {
-        continue;
-      }
-  
-      // Some transports emit tool parts with type names like "tool-run_risk_assessment".
-      // Render them as an expandable JSON blob so we can debug tool outputs.
-      if (typeof p?.type === 'string' && (p.type.startsWith('tool-') || p.type.startsWith('tool_'))) {
-        const toolName = p.type.replace(/^tool[-_]/, '');
-        out.push(
-          <details key={idx} style={{ marginTop: 6 }} open>
+
+    // Hide step bookkeeping parts (AI SDK emits these during multi-step runs)
+    if (p?.type === 'step-start' || p?.type === 'step-finish' || p?.type === 'step') {
+      continue;
+    }
+
+    // Tool parts like "tool-run_risk_assessment"
+    if (typeof p?.type === 'string' && (p.type.startsWith('tool-') || p.type.startsWith('tool_'))) {
+      const toolName = p.type.replace(/^tool[-_]/, '');
+      const output = (p as any).output;
+      const clauseItems = output?.clause_items;
+
+      out.push(
+        <div key={idx} style={{ marginTop: 6 }}>
+          {isClauseItems(clauseItems) && clauseItems.length ? <RiskClauseItemsView items={clauseItems} /> : null}
+
+          {/* Keep raw JSON for debugging */}
+          <details style={{ marginTop: isClauseItems(clauseItems) && clauseItems.length ? 10 : 0 }} open>
             <summary className="subtle">tool: {toolName}</summary>
             <div className="pre" style={{ marginTop: 6 }}>
-              {safeJsonPreview(p)}
+              {safeJsonPreview(output ?? p)}
             </div>
-          </details>,
-        );
-        continue;
-      }
+          </details>
+        </div>,
+      );
+      continue;
+    }
 
     if (p?.type === 'tool-invocation') {
       const inv: any = p.toolInvocation;
@@ -102,6 +259,15 @@ function renderMessageParts(m: any) {
       }
 
       if (inv?.result) {
+        const clauseItems = (inv.result as any)?.clause_items;
+        if (isClauseItems(clauseItems) && clauseItems.length) {
+          out.push(
+            <div key={`${idx}-clauseitems`} style={{ marginTop: 8 }}>
+              <RiskClauseItemsView items={clauseItems} />
+            </div>,
+          );
+        }
+
         out.push(
           <details key={`${idx}-result`} style={{ marginTop: 6 }} open>
             <summary className="subtle">result</summary>
@@ -117,9 +283,7 @@ function renderMessageParts(m: any) {
 
     out.push(
       <details key={idx} style={{ marginTop: 6 }}>
-        <summary className="subtle">
-          (unrendered part: {String(p?.type ?? 'unknown')})
-        </summary>
+        <summary className="subtle">(unrendered part: {String(p?.type ?? 'unknown')})</summary>
         <div className="pre" style={{ marginTop: 6 }}>
           {safeJsonPreview(p)}
         </div>
@@ -233,9 +397,7 @@ function formatChangesPlainTextForUI(c: Clause): string {
       lines.push('Comments:');
       for (const cm of comments) {
         const author = cm?.author ? String(cm.author) : 'Reviewer';
-        const anchor = cm?.anchor_text
-          ? String(cm.anchor_text).replace(/\s+/g, ' ').trim()
-          : '';
+        const anchor = cm?.anchor_text ? String(cm.anchor_text).replace(/\s+/g, ' ').trim() : '';
         const txt = (cm?.text ?? '').toString().trim();
         if (!txt) continue;
         if (anchor) {
@@ -413,11 +575,7 @@ export default function Page() {
               }}
             />
 
-            <button
-              className="btn btnPrimary"
-              onClick={onParse}
-              disabled={!file || parseLoading}
-            >
+            <button className="btn btnPrimary" onClick={onParse} disabled={!file || parseLoading}>
               {parseLoading ? 'Parsing…' : 'Parse'}
             </button>
 
@@ -434,39 +592,23 @@ export default function Page() {
             {!isPdf ? (
               <>
                 <label className="pill">
-                  <input
-                    type="checkbox"
-                    checked={optTrackedChanges}
-                    onChange={e => setOptTrackedChanges(e.target.checked)}
-                  />
+                  <input type="checkbox" checked={optTrackedChanges} onChange={e => setOptTrackedChanges(e.target.checked)} />
                   Tracked changes
                 </label>
                 <label className="pill">
-                  <input
-                    type="checkbox"
-                    checked={optComments}
-                    onChange={e => setOptComments(e.target.checked)}
-                  />
+                  <input type="checkbox" checked={optComments} onChange={e => setOptComments(e.target.checked)} />
                   Comments
                 </label>
               </>
             ) : (
               <label className="pill">
-                <input
-                  type="checkbox"
-                  checked={optAnnotations}
-                  onChange={e => setOptAnnotations(e.target.checked)}
-                />
+                <input type="checkbox" checked={optAnnotations} onChange={e => setOptAnnotations(e.target.checked)} />
                 PDF annotations
               </label>
             )}
 
             <label className="pill">
-              <input
-                type="checkbox"
-                checked={optRawSpans}
-                onChange={e => setOptRawSpans(e.target.checked)}
-              />
+              <input type="checkbox" checked={optRawSpans} onChange={e => setOptRawSpans(e.target.checked)} />
               Raw spans
             </label>
           </div>
@@ -507,9 +649,7 @@ export default function Page() {
                 </div>
               ) : null}
 
-              <div style={{ marginTop: 12, fontWeight: 600, fontSize: 13 }}>
-                Clause list
-              </div>
+              <div style={{ marginTop: 12, fontWeight: 600, fontSize: 13 }}>Clause list</div>
               <div className="clauses">
                 {parseResult.clauses.slice(0, 250).map(c => {
                   const active = c.clause_id === selectedClauseId;
@@ -579,9 +719,7 @@ export default function Page() {
         <div className="panelHeader">
           <div>
             <div style={{ fontWeight: 600, fontSize: 13 }}>Chat</div>
-            <div className="subtle">
-              Ask questions. The assistant can use tools to list/search/fetch clauses.
-            </div>
+            <div className="subtle">Ask questions. The assistant can use tools to list/search/fetch clauses.</div>
           </div>
           <div className="row">
             <button className="btn" onClick={() => stop()} disabled={!(status === 'streaming' || status === 'submitted')}>
@@ -615,11 +753,7 @@ export default function Page() {
             </div>
           ) : null}
 
-          <ChatComposer
-            disabled={status !== 'ready'}
-            onSend={onSend}
-            docReady={!!docId}
-          />
+          <ChatComposer disabled={status !== 'ready'} onSend={onSend} docReady={!!docId} />
         </div>
       </section>
     </div>

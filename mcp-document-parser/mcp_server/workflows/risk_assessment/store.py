@@ -6,12 +6,13 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import asyncio
 
 from ...schemas import (
     ClauseAssessment,
+    ClauseRiskResult,
     RiskAssessmentCancelOutput,
     RiskAssessmentGetClauseResultOutput,
     RiskAssessmentReportOutput,
@@ -54,7 +55,15 @@ class _AssessmentRecord:
     current_clause_id: Optional[str] = None
 
     # Results
+    # Back-compat: ClauseAssessment-only results
     clause_results: Dict[str, ClauseAssessment] = field(default_factory=dict)
+
+    # New: store the exact clause text used for assessment (including changes/comments if enabled)
+    clause_text_by_id: Dict[str, str] = field(default_factory=dict)
+
+    # New: richer per-clause result payload (text + structured assessment)
+    clause_risk_results: Dict[str, ClauseRiskResult] = field(default_factory=dict)
+
     summary: str = ""
     totals: Dict[str, Any] = field(default_factory=dict)
 
@@ -196,6 +205,41 @@ class RiskAssessmentStore:
             rec.completed_clauses = max(rec.completed_clauses, len(rec.clause_results))
             return True
 
+    async def put_clause_text(self, assessment_id: str, clause_id: str, text_with_changes: str) -> bool:
+        """Persist the clause text used for assessment (including changes/comments when present)."""
+        txt = (text_with_changes or "").strip()
+        if not txt:
+            return False
+        async with self._lock:
+            rec = self._items.get(assessment_id)
+            if rec is None:
+                return False
+            rec.clause_text_by_id[clause_id] = txt
+
+            # If we already have a rich result, update it with the text.
+            rr = rec.clause_risk_results.get(clause_id)
+            if rr is not None and (not rr.text_with_changes):
+                rec.clause_risk_results[clause_id] = rr.model_copy(update={"text_with_changes": txt})
+            return True
+
+    async def put_clause_risk_result(self, assessment_id: str, rr: ClauseRiskResult) -> bool:
+        """Store a richer per-clause result (text + assessment)."""
+        async with self._lock:
+            rec = self._items.get(assessment_id)
+            if rec is None:
+                return False
+
+            # If we already stored clause text, ensure it is present on the rich result.
+            txt = rec.clause_text_by_id.get(rr.clause_id)
+            if txt and not rr.text_with_changes:
+                rr = rr.model_copy(update={"text_with_changes": txt})
+
+            rec.clause_risk_results[rr.clause_id] = rr
+
+            # Keep progress monotonic
+            rec.completed_clauses = max(rec.completed_clauses, len(rec.clause_risk_results) or len(rec.clause_results))
+            return True
+
     async def set_report(self, assessment_id: str, *, summary: str, totals: Dict[str, Any]) -> bool:
         async with self._lock:
             rec = self._items.get(assessment_id)
@@ -243,9 +287,26 @@ class RiskAssessmentStore:
         rec = await self.get(assessment_id)
         if rec is None:
             return None
+        rr = rec.clause_risk_results.get(clause_id)
+        if rr is not None:
+            return RiskAssessmentGetClauseResultOutput(assessment_id=assessment_id, clause=rr)
+
         clause = rec.clause_results.get(clause_id)
         if clause is None:
             return None
+
+        # If we have stored text, wrap into a ClauseRiskResult for richer output.
+        txt = rec.clause_text_by_id.get(clause_id)
+        if txt:
+            wrapped = ClauseRiskResult(
+                clause_id=clause.clause_id,
+                label=clause.label,
+                title=clause.title,
+                text_with_changes=txt,
+                assessment=clause,
+            )
+            return RiskAssessmentGetClauseResultOutput(assessment_id=assessment_id, clause=wrapped)
+
         return RiskAssessmentGetClauseResultOutput(assessment_id=assessment_id, clause=clause)
 
     async def report_output(self, assessment_id: str) -> Optional[RiskAssessmentReportOutput]:
@@ -254,15 +315,51 @@ class RiskAssessmentStore:
             return None
 
         # Preserve original clause ordering
-        ordered_results: List[ClauseAssessment] = []
+        ordered_results: List[Union[ClauseAssessment, ClauseRiskResult]] = []
+
+        # Prefer rich results; otherwise fall back to assessments (wrapping with text if available).
+        plan_set = set(rec.clause_ids)
         for cid in rec.clause_ids:
-            r = rec.clause_results.get(cid)
-            if r is not None:
-                ordered_results.append(r)
+            rr = rec.clause_risk_results.get(cid)
+            if rr is not None:
+                ordered_results.append(rr)
+                continue
+
+            a = rec.clause_results.get(cid)
+            if a is not None:
+                txt = rec.clause_text_by_id.get(cid)
+                if txt:
+                    ordered_results.append(
+                        ClauseRiskResult(
+                            clause_id=a.clause_id,
+                            label=a.label,
+                            title=a.title,
+                            text_with_changes=txt,
+                            assessment=a,
+                        )
+                    )
+                else:
+                    ordered_results.append(a)
+
         # Include any results not in the plan (shouldn't happen, but be defensive)
-        for cid, r in rec.clause_results.items():
-            if cid not in set(rec.clause_ids):
-                ordered_results.append(r)
+        for cid, rr in rec.clause_risk_results.items():
+            if cid not in plan_set:
+                ordered_results.append(rr)
+        for cid, a in rec.clause_results.items():
+            if cid not in plan_set and cid not in rec.clause_risk_results:
+                txt = rec.clause_text_by_id.get(cid)
+                if txt:
+                    ordered_results.append(
+                        ClauseRiskResult(
+                            clause_id=a.clause_id,
+                            label=a.label,
+                            title=a.title,
+                            text_with_changes=txt,
+                            assessment=a,
+                        )
+                    )
+                else:
+                    ordered_results.append(a)
 
         return RiskAssessmentReportOutput(
             assessment_id=rec.assessment_id,
