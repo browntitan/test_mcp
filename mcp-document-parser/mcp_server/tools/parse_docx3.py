@@ -983,31 +983,50 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
 
             paragraph_blocks = _iter_paragraph_blocks(body)
 
-            # Pre-scan heading outline levels on visible, non-TOC paragraphs to pick a "primary" heading level
+            # Pre-scan headings on visible, non-TOC paragraphs so we can pick a "primary" heading level.
+            # Also compute a safe numeric boundary depth fallback for docs that don't expose outline levels.
+            #
+            # IMPORTANT FIX:
+            #   The prior heuristic chose the *most frequent* outline level, which can be wrong when
+            #   subclauses are styled as Heading 2/3 and occur far more often than top-level headings.
+            #   For the "one card per main clause" UX, we choose the *shallowest* outline level observed.
             toc_state_scan = _TocState()
             heading_levels: List[int] = []
+            numeric_depths: List[int] = []
+
             for (p, bk, _m) in paragraph_blocks:
                 toc_state_scan.update_from_paragraph(p)
                 if bk in ("deleted", "moved_from"):
                     continue
+
                 # We need clean text to evaluate literal TOC heading and TOC-ish styles
                 seg3 = list(_walk_text_segments_with_meta(p, kind="normal", meta=_RevMeta()))
-                clean_text = "".join(t for t, k, _mm in seg3 if k in ("normal", "inserted", "moved_to")).replace("\r", "")
+                clean_text = "".join(
+                    t for t, k, _mm in seg3 if k in ("normal", "inserted", "moved_to")
+                ).replace("\r", "")
+
                 sid = _pstyle_id(p)
                 if _is_toc_paragraph(clean_text, sid, toc_state_scan):
                     continue
+
+                # Prefer Word outline levels / heading styles.
                 ol = _paragraph_outline_level(p, style_outline)
                 if ol is not None:
                     heading_levels.append(int(ol))
 
+                # Numeric fallback boundaries should only consider paragraphs that are NOT list-numbered.
+                # This avoids splitting subclauses that are implemented as lists (w:numPr).
+                if not _has_numpr(p):
+                    k3, _lbl, _ttl, nd = _detect_label_kind((clean_text or "").strip())
+                    if k3 == "numeric" and nd is not None:
+                        numeric_depths.append(int(nd))
+
             # Primary heading level heuristic:
-            # - choose the most frequent outline level if present, else None.
-            primary_heading_level: Optional[int] = None
-            if heading_levels:
-                freq: Dict[int, int] = defaultdict(int)
-                for lv in heading_levels:
-                    freq[lv] += 1
-                primary_heading_level = max(freq.items(), key=lambda kv: kv[1])[0]
+            # For "one card per main clause", treat the SHALLOWEST outline level observed as the boundary.
+            primary_heading_level: Optional[int] = min(heading_levels) if heading_levels else None
+
+            # Numeric boundary depth fallback: choose the shallowest numeric depth observed.
+            numeric_boundary_depth: Optional[int] = min(numeric_depths) if numeric_depths else None
 
             clauses: List[Clause] = []
             current_clause: Optional[Clause] = None
@@ -1140,49 +1159,42 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                             anchor_text=anchors.get(cid) or None,
                         )
 
-                # Determine if this paragraph starts a new clause.
-                # Strategy:
-                #   - If we have a primary heading outline level (detected in doc), treat those paragraphs as boundaries.
-                #   - Otherwise, fall back to ARTICLE/SECTION/numeric headings.
+                # Determine if this paragraph starts a new *top-level* clause.
+                # Goal: one Clause object per main clause, with subclauses kept inside the clause text.
+                #
+                # Rules:
+                #   1) If outline levels are available, ONLY paragraphs at the primary (shallowest) heading level
+                #      start a new clause.
+                #      - However, if a paragraph has NO outline level but clearly matches ARTICLE/SECTION,
+                #        still allow it to start a clause (common in some templates).
+                #   2) If outline levels are missing, fall back to ARTICLE/SECTION or numeric headings at the
+                #      shallowest observed numeric depth, but DO NOT split on list-numbered paragraphs (w:numPr).
                 is_boundary = False
+                is_list_item = _has_numpr(p)
 
                 if block_kind not in ("deleted", "moved_from"):
-                    # Prefer outline levels when present
-                    if primary_heading_level is not None and outline_level is not None:
-                        if outline_level == primary_heading_level:
+                    if primary_heading_level is not None:
+                        # Heading-driven mode
+                        if outline_level is not None and int(outline_level) == int(primary_heading_level):
                             is_boundary = True
-                        else:
-                            # If it's a clear ARTICLE/SECTION heading, still a boundary.
-                            if kind in ("article", "section"):
-                                is_boundary = True
-
+                        elif outline_level is None and kind in ("article", "section") and not is_list_item:
+                            is_boundary = True
                     else:
-                        # Fallback to text-based detection
-                        if kind in ("article", "section"):
+                        # Fallback mode
+                        if kind in ("article", "section") and not is_list_item:
                             is_boundary = True
-                        elif kind == "numeric":
-                            # In these contract formats, top-level clauses are usually depth=1.
-                            # If we inferred via numbering, num_ilvl==0 is also a strong signal.
-                            if (num_ilvl is not None and num_ilvl == 0) or (num_depth is not None and num_depth <= 1):
-                                is_boundary = True
+                        elif (
+                            kind == "numeric"
+                            and not is_list_item
+                            and numeric_boundary_depth is not None
+                            and num_depth is not None
+                            and int(num_depth) == int(numeric_boundary_depth)
+                        ):
+                            is_boundary = True
 
-                # Choose clause level (hierarchy):
-                # - If outline level exists, map outlineLvl 0->level 1, 1->2, etc.
-                # - Else, use simple heuristics: article/section/numeric
+                # Clause level:
+                # Since we intentionally group subclauses into the parent clause, all emitted clauses are level 1.
                 level = 1
-                if outline_level is not None:
-                    level = max(1, int(outline_level) + 1)
-                else:
-                    if kind == "article":
-                        level = 1
-                    elif kind == "section":
-                        level = 2
-                    elif kind == "numeric":
-                        # If we have num_ilvl, use that; else numeric depth
-                        if num_ilvl is not None:
-                            level = max(1, int(num_ilvl) + 1)
-                        elif num_depth is not None:
-                            level = max(1, int(num_depth))
 
                 # Build the visible header line we store in clause.text for boundary paragraphs.
                 header_line = _mk_header_line(label, title, clean_text)
@@ -1195,7 +1207,7 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                         clause_id="",  # set later
                         label=label,
                         title=title,
-                        level=max(1, int(level)),
+                        level=1,
                         parent_clause_id=None,
                         text=header_line.strip(),
                         raw_spans=raw_spans,
