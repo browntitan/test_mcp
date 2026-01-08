@@ -183,7 +183,7 @@ class LLMClient:
         *,
         messages: List[ChatMessage],
         temperature: float = 0.2,
-        max_tokens: int = 1200,
+        max_tokens: int = 12000,
         model: Optional[str] = None,
     ) -> str:
         url = self._chat_url()
@@ -212,7 +212,7 @@ class LLMClient:
         messages: List[ChatMessage],
         schema: Type[T],
         temperature: float = 0.0,
-        max_tokens: int = 1500,
+        max_tokens: int = 15000,
         model: Optional[str] = None,
     ) -> T:
         # Force JSON-only output.

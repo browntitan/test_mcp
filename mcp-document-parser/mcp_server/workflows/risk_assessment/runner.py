@@ -451,7 +451,7 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                         messages=[sys, user],
                         schema=ClauseAssessment,
                         temperature=0.0,
-                        max_tokens=1800,
+                        max_tokens=18000,
                     )
                     break
                 except Exception as e:
@@ -548,8 +548,8 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                     ),
                     ChatMessage(role="user", content=summary_seed),
                 ],
-                temperature=0.2,
-                max_tokens=900,
+                temperature=0.1,
+                max_tokens=12000,
             )
         except Exception:
             # Deterministic fallback

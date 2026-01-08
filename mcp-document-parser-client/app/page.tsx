@@ -455,6 +455,8 @@ export default function Page() {
 
   const [parseLoading, setParseLoading] = useState(false);
   const [parseError, setParseError] = useState<string | null>(null);
+  const [uploadLoading, setUploadLoading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
   const [optTrackedChanges, setOptTrackedChanges] = useState(true);
   const [optComments, setOptComments] = useState(true);
@@ -474,6 +476,42 @@ export default function Page() {
     if (!file) return false;
     return inferIsPdf(file.name, file.type);
   }, [file]);
+
+  async function onUploadOnly(selected: File): Promise<string> {
+    setUploadError(null);
+    setUploadLoading(true);
+
+    try {
+      const file_base64 = await readFileAsBase64(selected);
+
+      const res = await fetch('/api/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: selected.name,
+          file_base64,
+        }),
+      });
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        throw new Error(txt || `Upload failed (${res.status})`);
+      }
+
+      const data = (await res.json()) as { docId: string };
+      if (!data?.docId) throw new Error('Upload did not return a docId');
+
+      setDocId(data.docId);
+      return data.docId;
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      setUploadError(msg);
+      setDocId(null);
+      throw e;
+    } finally {
+      setUploadLoading(false);
+    }
+  }
 
   async function onParse() {
     if (!file) return;
@@ -527,16 +565,30 @@ export default function Page() {
 
   async function onSend(text: string) {
     if (!text.trim()) return;
-    if (!docId) {
-      alert('Parse a document first (left panel).');
-      return;
+
+    // IMPORTANT: Ensure we have a docId. React state updates are async, so use a local variable.
+    let effectiveDocId = docId;
+
+    if (!effectiveDocId) {
+      // If a file is selected but not uploaded yet, try uploading now.
+      if (file) {
+        try {
+          effectiveDocId = await onUploadOnly(file);
+        } catch {
+          alert('Upload failed. Please re-select the file and try again.');
+          return;
+        }
+      } else {
+        alert('Upload a document first (left panel).');
+        return;
+      }
     }
 
     await sendMessage(
       { text },
       {
         body: {
-          docId,
+          docId: effectiveDocId,
           focusClauseId: selectedClauseId,
         },
       },
@@ -565,13 +617,26 @@ export default function Page() {
               className="input"
               type="file"
               accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-              onChange={e => {
+              onChange={async e => {
                 const f = e.target.files?.[0] || null;
                 setFile(f);
-                setDocId(null);
+
+                // Reset parse state (clause browsing requires parsing)
                 setParseResult(null);
                 setSelectedClauseId(null);
                 setParseError(null);
+
+                // Reset upload state/docId then upload so chat/risk can run without parsing
+                setUploadError(null);
+                setDocId(null);
+
+                if (f) {
+                  try {
+                    await onUploadOnly(f);
+                  } catch {
+                    // uploadError is already set
+                  }
+                }
               }}
             />
 
@@ -581,7 +646,8 @@ export default function Page() {
 
             {docId ? (
               <span className="pill ok">
-                Parsed <span className="mono">{docId.slice(0, 8)}</span>
+                {parseResult ? 'Parsed' : uploadLoading ? 'Uploading…' : 'Uploaded'}{' '}
+                <span className="mono">{docId.slice(0, 8)}</span>
               </span>
             ) : (
               <span className="pill subtle">No document loaded</span>
@@ -592,7 +658,11 @@ export default function Page() {
             {!isPdf ? (
               <>
                 <label className="pill">
-                  <input type="checkbox" checked={optTrackedChanges} onChange={e => setOptTrackedChanges(e.target.checked)} />
+                  <input
+                    type="checkbox"
+                    checked={optTrackedChanges}
+                    onChange={e => setOptTrackedChanges(e.target.checked)}
+                  />
                   Tracked changes
                 </label>
                 <label className="pill">
@@ -602,7 +672,11 @@ export default function Page() {
               </>
             ) : (
               <label className="pill">
-                <input type="checkbox" checked={optAnnotations} onChange={e => setOptAnnotations(e.target.checked)} />
+                <input
+                  type="checkbox"
+                  checked={optAnnotations}
+                  onChange={e => setOptAnnotations(e.target.checked)}
+                />
                 PDF annotations
               </label>
             )}
@@ -616,6 +690,12 @@ export default function Page() {
           {parseError ? (
             <div style={{ marginTop: 10 }} className="subtle danger">
               {parseError}
+            </div>
+          ) : null}
+
+          {uploadError ? (
+            <div style={{ marginTop: 10 }} className="subtle danger">
+              {uploadError}
             </div>
           ) : null}
 
@@ -697,11 +777,7 @@ export default function Page() {
                   {(() => {
                     const changesText = formatChangesPlainTextForUI(selectedClause);
                     if (!changesText) return null;
-                    return (
-                      <div className="pre" style={{ marginTop: 8 }}>
-                        {changesText}
-                      </div>
-                    );
+                    return <div className="pre" style={{ marginTop: 8 }}>{changesText}</div>;
                   })()}
                 </div>
               ) : null}
@@ -787,7 +863,7 @@ function ChatComposer({
         value={input}
         onChange={e => setInput(e.target.value)}
         disabled={disabled}
-        placeholder={docReady ? 'Ask about the document…' : 'Parse a document first…'}
+        placeholder={docReady ? 'Ask about the document…' : 'Upload a document first…'}
       />
       <button className="btn btnPrimary" type="submit" disabled={disabled || !input.trim()}>
         Send

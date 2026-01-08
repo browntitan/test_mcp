@@ -2,8 +2,30 @@ import { z } from 'zod';
 import { createOpenAI } from '@ai-sdk/openai';
 import { convertToModelMessages, stepCountIs, streamText, tool, type UIMessage } from 'ai';
 
-import { getDocument } from '../../../lib/documentStore';
+import { getDocument, getUpload } from '../../../lib/documentStore';
+import type { StoredUpload } from '../../../lib/documentStore';
 import type { Clause, StoredDocument } from '../../../lib/types';
+function getUploadMeta(up: StoredUpload) {
+  const ft = up.fileType || (up.filename.toLowerCase().endsWith('.pdf') ? 'pdf' : 'docx');
+  const media_type = up.mediaType
+    ? up.mediaType
+    : ft === 'pdf'
+      ? 'application/pdf'
+      : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
+  return {
+    filename: up.filename,
+    media_type,
+    pages: null,
+    word_count: null,
+    clause_count: 0,
+    warnings: [],
+  };
+}
+
+function inferUploadFileType(up: StoredUpload): 'pdf' | 'docx' {
+  return up.fileType || (up.filename.toLowerCase().endsWith('.pdf') ? 'pdf' : 'docx');
+}
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -406,16 +428,18 @@ export async function POST(req: Request) {
   const { docId, focusClauseId, messages } = parsed.data;
 
   const doc = getDocument(docId);
-  if (!doc) {
+  const upload = getUpload(docId);
+
+  if (!doc && !upload) {
     return Response.json(
-      { error: 'Document not found. Parse again to get a new docId.' },
+      { error: 'Document not found. Upload/parse again to get a new docId.' },
       { status: 404 },
     );
   }
 
-  const data: any = doc.data;
-  const clauses: Clause[] = data.clauses ?? [];
-  const meta = getDocMeta(doc);
+  const data: any = doc ? (doc as any).data : null;
+  const clauses: Clause[] = (data?.clauses ?? []) as Clause[];
+  const meta = doc ? getDocMeta(doc) : getUploadMeta(upload as StoredUpload);
 
   const focusClause = focusClauseId ? findClause(clauses, focusClauseId) : undefined;
 
@@ -537,7 +561,7 @@ export async function POST(req: Request) {
         'Start the clause-by-clause risk assessment workflow for the currently loaded document (no docId needed). Returns an assessment_id immediately. Use get_risk_assessment_status to poll and get_risk_assessment_report to fetch the final report.',
       inputSchema: z.object({
         policy_collection: z.string().default('default'),
-        top_k: z.number().int().min(1).max(50).default(6),
+        top_k: z.number().int().min(1).max(50).default(3),
         min_score: z.number().optional(),
         model_profile: z.enum(['chat', 'assessment']).default('assessment'),
         mode: z.enum(['sync', 'async']).optional(),
@@ -548,8 +572,10 @@ export async function POST(req: Request) {
       }),
       execute: async (args: any) => {
         const parseResult: any = data;
+        const uploadPayload = upload as StoredUpload | undefined;
+        const hasParseResult = !!(parseResult && typeof parseResult === 'object' && Array.isArray((parseResult as any)?.clauses));
 
-        const clauseCount = Array.isArray((parseResult as any)?.clauses) ? (parseResult as any).clauses.length : null;
+        const clauseCount = hasParseResult ? (parseResult as any).clauses.length : null;
 
         const waitForCompletion = args?.wait_for_completion !== false; // default true
         const maxWaitMs = Number.isFinite(args?.max_wait_ms) ? Number(args.max_wait_ms) : 45_000;
@@ -563,14 +589,23 @@ export async function POST(req: Request) {
         }
 
         const startPayload: any = {
-          parse_result: parseResult,
           policy_collection: args?.policy_collection ?? 'default',
-          top_k: args?.top_k ?? 6,
+          top_k: args?.top_k ?? 3,
           min_score: args?.min_score,
           model_profile: args?.model_profile ?? 'assessment',
           include_text_with_changes: true,
           mode: effectiveMode,
         };
+
+        if (hasParseResult) {
+          startPayload.parse_result = parseResult;
+        } else if (uploadPayload && uploadPayload.fileBase64) {
+          startPayload.file_base64 = uploadPayload.fileBase64;
+          startPayload.filename = uploadPayload.filename;
+          startPayload.file_type = inferUploadFileType(uploadPayload);
+        } else {
+          return { error: 'No parsed document or upload payload available for this docId.' };
+        }
 
         const started = await mcpCallTool('risk_assessment.start', startPayload);
         const assessment_id = (started as any)?.assessment_id;
@@ -749,7 +784,7 @@ export async function POST(req: Request) {
 
   const system = [
     `You are a legal document analysis assistant.`,
-    `The user is chatting about ONE parsed document.`,
+    `The user is chatting about ONE document (parsed results may be available; risk assessment can parse on demand).`,
     `Use the available tools to inspect the document clause-by-clause (don't guess).`,
     `If the user asks for a risk assessment, call run_risk_assessment (no docId needed). Prefer wait_for_completion=true; it returns report (JSON) + clause_items (per-clause results) and often report_markdown.`,
     `If run_risk_assessment returns an assessment_id but final_status is not completed, use get_risk_assessment_status and then get_risk_assessment_report with that assessment_id.`,
