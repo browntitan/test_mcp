@@ -5,7 +5,8 @@ import json
 import logging
 import uuid
 from typing import Any, Dict, Optional
-
+import base64
+from fastapi import File, Form, UploadFile
 import structlog
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,7 +30,6 @@ from .schemas import (
     to_jsonable,
 )
 from .tools import MCP_TOOL_NAMES, normalize_clauses, parse_docx, parse_pdf, risk_assessment
-
 
 PROTOCOL_VERSION = "2024-11-05"
 
@@ -98,6 +98,15 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # ------------------
+    # REST wrapper endpoints (for OpenWebUI Actions)
+    # ------------------
+    # Import here (inside create_app) so module import order doesn't matter and we can
+    # attach the router to the FastAPI instance we just created.
+    from .rest_risk import router as risk_router
+
+    app.include_router(risk_router)
+
     @app.get("/health")
     async def health() -> Dict[str, Any]:
         return {"status": "healthy", "version": __version__}
@@ -105,6 +114,43 @@ def create_app() -> FastAPI:
     # ------------------
     # Direct HTTP endpoints
     # ------------------
+
+    @app.post("/tools/risk_assessment/start_upload")
+    async def http_risk_assessment_start_upload(
+        file: UploadFile = File(...),
+        extract_comments: bool = Form(True),
+        extract_tracked_changes: bool = Form(True),
+        include_raw_spans: bool = Form(False),
+    ) -> Dict[str, Any]:
+        try:
+            blob = await file.read()
+            if not blob:
+                raise HTTPException(status_code=400, detail="Empty file upload")
+
+            b64 = base64.b64encode(blob).decode("utf-8")
+            payload = {
+                "file_path": None,
+                "file_base64": b64,
+                "filename": file.filename,
+                "options": {
+                    "extract_comments": extract_comments,
+                    "extract_tracked_changes": extract_tracked_changes,
+                    "include_raw_spans": include_raw_spans,
+                },
+            }
+
+            # This will tell you immediately if your RiskAssessmentStartInput expects different fields.
+            inp = RiskAssessmentStartInput.model_validate(payload)
+            result = await risk_assessment.risk_assessment_start(inp)
+            return result.model_dump(mode="json")
+
+        except HTTPException:
+            raise
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            log.exception("risk_assessment.start_upload failed", error=str(e))
+            raise HTTPException(status_code=500, detail="Internal server error")
 
     @app.post("/tools/parse_docx")
     async def http_parse_docx(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
