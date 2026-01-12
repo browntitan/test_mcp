@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import re
 from dataclasses import dataclass
@@ -151,10 +152,40 @@ class LLMClient:
             keepalive_expiry=keepalive_expiry,
         )
 
+        # TLS / proxy behavior
+        # - Some enterprise environments use TLS interception; allow disabling verification or providing a CA bundle.
+        # - Keep this opt-in via env vars so local dev remains secure by default.
+        verify: bool | str = True
+        follow_redirects = True
+        trust_env = True  # respect HTTPS_PROXY/HTTP_PROXY/NO_PROXY if set
+
+        if self.profile.provider == "azure_openai":
+            # Prefer a CA bundle over disabling verification.
+            ca_bundle = (
+                os.getenv("AZURE_OPENAI_CA_BUNDLE", "").strip()
+                or os.getenv("AZURE_CA_BUNDLE", "").strip()
+                or os.getenv("REQUESTS_CA_BUNDLE", "").strip()
+                or os.getenv("SSL_CERT_FILE", "").strip()
+            )
+            if ca_bundle:
+                verify = ca_bundle
+            else:
+                # Explicit opt-out switch (use only when you cannot install the corp CA bundle).
+                v = (
+                    os.getenv("AZURE_OPENAI_SSL_VERIFY", "").strip()
+                    or os.getenv("AZURE_SSL_VERIFY", "").strip()
+                    or os.getenv("SSL_VERIFY", "").strip()
+                )
+                if v.lower() in ("0", "false", "no", "off"):
+                    verify = False
+
         self._client = httpx.AsyncClient(
             timeout=self.timeout_s,
             headers=self._base_headers(),
             limits=limits,
+            verify=verify,
+            follow_redirects=follow_redirects,
+            trust_env=trust_env,
         )
 
     def _base_headers(self) -> Dict[str, str]:
@@ -306,7 +337,15 @@ class LLMClient:
             try:
                 return resp.json()
             except Exception as e:
-                raise LLMError(f"LLM returned non-JSON response: {e}; body={resp.text[:500]}") from e
+                ct = (resp.headers.get("content-type") or "").strip()
+                loc = (resp.headers.get("location") or "").strip()
+                req_ids = _header_request_ids(resp.headers)
+                req_ids_str = " ".join([f"{k}={v}" for k, v in req_ids.items()])
+                snippet = (resp.text or "")[:800]
+                raise LLMError(
+                    f"LLM returned non-JSON response: {e}; status={resp.status_code} content_type={ct!r} "
+                    f"location={loc!r} {req_ids_str}; body={snippet}"
+                ) from e
 
         # Should not happen, but be defensive.
         raise LLMError(f"LLM request failed after retries: {last_exc}")
