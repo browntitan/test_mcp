@@ -47,6 +47,18 @@ class ModelProfile(BaseModel):
     azure_embeddings_deployment: Optional[str] = None
     azure_embeddings_api_version: Optional[str] = None
 
+    # -----------------
+    # Optional runtime tuning (used by providers/llm.py)
+    # -----------------
+    timeout_seconds: Optional[float] = None
+    max_retries: Optional[int] = None
+    retry_backoff_base_s: Optional[float] = None
+    retry_backoff_max_s: Optional[float] = None
+
+    max_connections: Optional[int] = None
+    max_keepalive_connections: Optional[int] = None
+    keepalive_expiry_s: Optional[float] = None
+
     # Optional headers passthrough (enterprise proxies, etc.)
     headers: Dict[str, str] = Field(default_factory=dict)
 
@@ -60,6 +72,18 @@ class ModelProfile(BaseModel):
                 raise ValueError(
                     "azure_openai profile requires azure_endpoint, azure_api_version, and azure_deployment"
                 )
+
+            # Fail fast if no auth is configured. The provider layer will send either:
+            #   - the `api-key` header (preferred), or
+            #   - whatever the caller provided via `headers`.
+            has_key = bool((self.api_key or "").strip())
+            has_hdr_key = False
+            try:
+                has_hdr_key = bool((self.headers.get("api-key") or "").strip()) or bool((self.headers.get("Authorization") or "").strip())
+            except Exception:
+                has_hdr_key = False
+            if not has_key and not has_hdr_key:
+                raise ValueError("azure_openai profile requires api_key or headers['api-key']/headers['Authorization']")
         return self
 
 
@@ -107,7 +131,7 @@ class Settings(BaseSettings):
     # -----------------
     # Embeddings configuration
     # -----------------
-    embeddings_model_profile: str = Field(default="chat", alias="EMBEDDINGS_MODEL_PROFILE")
+    embeddings_model_profile: str = Field(default="", alias="EMBEDDINGS_MODEL_PROFILE")
     embeddings_dim: int = Field(default=768, alias="EMBEDDINGS_DIM")
 
     # Ollama native embeddings endpoint + model
@@ -167,9 +191,33 @@ class Settings(BaseSettings):
                     "azure_api_version": _s(self.azure_openai_api_version) or self.azure_openai_api_version,
                     "azure_deployment": _s(self.azure_openai_deployment) or self.azure_openai_deployment,
                     "api_key": _s(self.azure_openai_api_key) or self.azure_openai_api_key,
-                    "azure_embeddings_deployment": _s(self.azure_openai_embeddings_deployment) or _s(self.azure_openai_deployment) or self.azure_openai_deployment,
-                    "azure_embeddings_api_version": _s(self.azure_openai_embeddings_api_version) or _s(self.azure_openai_api_version) or self.azure_openai_api_version,
+
+                    # Do NOT silently fall back to the chat deployment for embeddings.
+                    # Use a dedicated embeddings profile (created below) for retrieval.
+                    "azure_embeddings_deployment": _s(self.azure_openai_embeddings_deployment) or None,
+                    "azure_embeddings_api_version": _s(self.azure_openai_embeddings_api_version)
+                    or _s(self.azure_openai_api_version)
+                    or self.azure_openai_api_version,
                 }
+
+                # Dedicated embeddings profile (recommended: Ada-002 deployment).
+                # This ensures we never accidentally embed with the chat deployment.
+                if self.azure_openai_embeddings_deployment and str(self.azure_openai_embeddings_deployment).strip():
+                    profiles["embeddings"] = {
+                        "provider": "azure_openai",
+                        "azure_endpoint": _s(self.azure_openai_endpoint) or self.azure_openai_endpoint,
+                        "azure_api_version": _s(self.azure_openai_api_version) or self.azure_openai_api_version,
+
+                        # Keep azure_deployment populated for validation/back-compat.
+                        "azure_deployment": _s(self.azure_openai_deployment) or self.azure_openai_deployment,
+                        "api_key": _s(self.azure_openai_api_key) or self.azure_openai_api_key,
+
+                        "azure_embeddings_deployment": _s(self.azure_openai_embeddings_deployment)
+                        or self.azure_openai_embeddings_deployment,
+                        "azure_embeddings_api_version": _s(self.azure_openai_embeddings_api_version)
+                        or _s(self.azure_openai_api_version)
+                        or self.azure_openai_api_version,
+                    }
             else:
                 profiles["assessment"] = profiles["chat"]
 
@@ -198,6 +246,28 @@ class Settings(BaseSettings):
                     cfg[k] = cfg[k].strip()
 
             built[name] = ModelProfile(**cfg)
+
+        # -----------------
+        # Auto defaults (only when user did NOT explicitly set env values)
+        # -----------------
+        fields_set = getattr(self, "model_fields_set", set()) or set()
+
+        # Prefer a dedicated embeddings profile when present.
+        if "embeddings_model_profile" not in fields_set:
+            if "embeddings" in built:
+                self.embeddings_model_profile = "embeddings"
+            elif not (self.embeddings_model_profile or "").strip():
+                self.embeddings_model_profile = "chat"
+        else:
+            # If user explicitly set it to empty, normalize to chat.
+            if not (self.embeddings_model_profile or "").strip():
+                self.embeddings_model_profile = "chat"
+
+        # If user didn't set EMBEDDINGS_DIM and an Azure embeddings profile is present,
+        # default to 1536 (text-embedding-ada-002).
+        if "embeddings_dim" not in fields_set:
+            if "embeddings" in built:
+                self.embeddings_dim = 1536
 
         self.model_profiles = built
         return self

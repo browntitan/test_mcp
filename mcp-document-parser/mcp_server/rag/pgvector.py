@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 from dataclasses import dataclass
@@ -35,9 +36,67 @@ class PgVectorSearchConfig:
     distance_operator: str = "<=>"
 
 
+
 # -----------------------------
 # Utilities
 # -----------------------------
+
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+
+
+def _safe_ident(name: str, *, kind: str) -> str:
+    """Validate a SQL identifier used in f-string SQL composition.
+
+    We only allow schema-qualified identifiers like `public.table`.
+    This prevents SQL injection if a caller overrides PgVectorSearchConfig.
+    """
+    n = (name or "").strip()
+    if not n or not _IDENT_RE.match(n):
+        raise ValueError(f"Invalid SQL identifier for {kind}: {name!r}")
+    return n
+
+
+def _coerce_embedding(vec: Any, *, expected_dim: Optional[int] = None) -> List[float]:
+    """Coerce an embedder return into a 1D list[float] and optionally validate dimension.
+
+    Supported:
+      - Sequence[float]
+      - Sequence[Sequence[float]] with length==1 (we flatten)
+
+    Raises:
+      - ValueError with actionable guidance on mismatch.
+    """
+    if vec is None:
+        raise ValueError("Embedder returned None")
+
+    # If someone accidentally passes an embedder that returns a batch (e.g., [[...]]), flatten when size==1.
+    if isinstance(vec, (list, tuple)) and vec and isinstance(vec[0], (list, tuple)):
+        if len(vec) == 1:
+            vec = vec[0]
+        else:
+            raise ValueError(
+                "Embedder returned a batch of embeddings, but pgvector search expects a single vector for a single query string."
+            )
+
+    if not isinstance(vec, (list, tuple)):
+        raise ValueError(f"Embedder returned non-sequence embedding: {type(vec).__name__}")
+
+    out: List[float] = []
+    for x in vec:
+        try:
+            out.append(float(x))
+        except Exception:
+            raise ValueError("Embedder returned a vector containing non-numeric values")
+
+    if expected_dim is not None and expected_dim > 0 and len(out) != int(expected_dim):
+        raise ValueError(
+            f"Embedding dimension mismatch: got {len(out)}, expected {int(expected_dim)}. "
+            "This usually means your embeddings model/deployment changed (e.g., Ada-002 is 1536) or your database vector column was created with a different dimension. "
+            "Fix by aligning EMBEDDINGS_DIM, the embeddings deployment, and the pgvector column dimension; then re-embed policy chunks."
+        )
+
+    return out
 
 
 def _normalize_db_url(url: str) -> str:
@@ -66,7 +125,8 @@ def _vector_literal(vec: Sequence[float]) -> str:
 
 
 async def _maybe_await(v: Union[Any, Awaitable[Any]]) -> Any:
-    if asyncio.iscoroutine(v) or isinstance(v, Awaitable):
+    # `typing.Awaitable` is not always safe for isinstance checks; use inspect.
+    if inspect.isawaitable(v):
         return await v  # type: ignore[misc]
     return v
 
@@ -199,6 +259,15 @@ class PgVectorPolicyRetriever:
         settings = get_settings()
         cfg = self._cfg
 
+        # Validate identifiers to avoid SQL injection if cfg is overridden.
+        table = _safe_ident(cfg.table, kind="table")
+        embedding_col = _safe_ident(cfg.embedding_column, kind="embedding_column")
+        text_col = _safe_ident(cfg.text_column, kind="text_column")
+        metadata_col = _safe_ident(cfg.metadata_column, kind="metadata_column")
+        policy_id_col = _safe_ident(cfg.policy_id_column, kind="policy_id_column")
+        chunk_id_col = _safe_ident(cfg.chunk_id_column, kind="chunk_id_column")
+        collection_col = _safe_ident(cfg.collection_column, kind="collection_column")
+
         collection = (collection or settings.policy_default_collection).strip() or "default"
         top_k = int(top_k or settings.policy_top_k_default)
         top_k = max(1, min(50, top_k))
@@ -207,32 +276,34 @@ class PgVectorPolicyRetriever:
         if use_embedder is None:
             raise RuntimeError(
                 "No embedder configured for pgvector retrieval. Provide an embedder to PgVectorPolicyRetriever "
-                "or pass embedder=... to search()."
+                "or pass embedder=... to search(). In the risk workflow, this should come from your embeddings model profile "
+                "(e.g., Azure Ada-002 deployment or Ollama embeddings endpoint)."
             )
 
-        vec = await _maybe_await(use_embedder(query))
-        vec_list = [float(x) for x in vec]
+        raw_vec = await _maybe_await(use_embedder(query))
+        # Validate and normalize embeddings against configured dimension (e.g., Ada-002 is 1536).
+        vec_list = _coerce_embedding(raw_vec, expected_dim=getattr(settings, "embeddings_dim", None))
         vec_lit = _vector_literal(vec_list)
 
         filter_sql, filter_params = _build_filter_sql(filters or {}, cfg)
 
         # Score definition: 1 - cosine_distance
         # Distance operator '<=>' is cosine distance in pgvector.
-        distance_expr = f"{cfg.embedding_column} {cfg.distance_operator} (%(qvec)s)::vector"
+        distance_expr = f"{embedding_col} {cfg.distance_operator} (%(qvec)s)::vector"
         score_expr = f"(1 - ({distance_expr}))"
 
-        where_clause = f"{cfg.collection_column} = %(collection)s{filter_sql}"
+        where_clause = f"{collection_col} = %(collection)s{filter_sql}"
         if min_score is not None:
             where_clause += " AND " + score_expr + " >= %(min_score)s"
 
         sql = f"""
             SELECT
-              {cfg.policy_id_column} AS policy_id,
-              {cfg.chunk_id_column} AS chunk_id,
-              {cfg.text_column} AS text,
-              {cfg.metadata_column} AS metadata,
+              {policy_id_col} AS policy_id,
+              {chunk_id_col} AS chunk_id,
+              {text_col} AS text,
+              {metadata_col} AS metadata,
               {score_expr} AS score
-            FROM {cfg.table}
+            FROM {table}
             WHERE {where_clause}
             ORDER BY {distance_expr} ASC
             LIMIT %(top_k)s

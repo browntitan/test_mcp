@@ -32,11 +32,17 @@ from ...workflows.risk_assessment.store import get_store
 logger = logging.getLogger(__name__)
 
 # Prompt-size guards to reduce truncated/invalid JSON responses.
-MAX_CLAUSE_CHARS = 10000
-MAX_CLAUSE_CHARS_RETRY = 10000
-MAX_POLICY_SNIPPET_CHARS = 10000
-MAX_POLICY_BLOCK_CHARS = 10000
-MAX_POLICY_BLOCK_CHARS_RETRY = 10000
+MAX_CLAUSE_CHARS = 14000
+MAX_CLAUSE_CHARS_RETRY = 14000
+MAX_POLICY_SNIPPET_CHARS = 14000
+MAX_POLICY_BLOCK_CHARS = 14000
+MAX_POLICY_BLOCK_CHARS_RETRY = 14000
+
+# Output token guards (Azure-friendly). These should be enough for your bounded JSON schema.
+# If you need to tune these later, we can move them into Settings/ModelProfile.
+MAX_ASSESSMENT_OUTPUT_TOKENS = 14000
+MAX_SUMMARY_OUTPUT_TOKENS = 14000
+
 
 
 def _infer_file_type(file_path: Optional[str], filename: Optional[str], explicit: Optional[str]) -> Optional[str]:
@@ -51,6 +57,43 @@ def _infer_file_type(file_path: Optional[str], filename: Optional[str], explicit
     if name.endswith(".pdf"):
         return "pdf"
     return None
+
+
+def _norm_profile_name(name: Optional[str]) -> Optional[str]:
+    if name is None:
+        return None
+    n = str(name).strip()
+    return n or None
+
+
+def _resolve_profile(settings: Any, preferred: Optional[str], *, fallback: Optional[str]) -> str:
+    """Resolve a model profile name safely.
+
+    - Uses `preferred` if present and exists in settings.model_profiles
+    - Else uses `fallback` if present and exists
+    - Else falls back to the first available profile name (deterministic order)
+    """
+
+    preferred_n = _norm_profile_name(preferred)
+    fallback_n = _norm_profile_name(fallback)
+
+    profiles = getattr(settings, "model_profiles", {}) or {}
+    if preferred_n and preferred_n in profiles:
+        return preferred_n
+    if fallback_n and fallback_n in profiles:
+        return fallback_n
+
+    # Deterministic fallback: prefer commonly expected names.
+    for k in ("assessment", "chat", "embeddings"):
+        if k in profiles:
+            return k
+
+    # Last resort: first profile in sorted order.
+    if profiles:
+        return sorted(list(profiles.keys()))[0]
+
+    # Should never happen; Settings always builds at least one profile.
+    return preferred_n or fallback_n or "chat"
 
 
 def _changes_plain_text(clause: Clause) -> str:
@@ -286,10 +329,23 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
     # Use a dedicated model profile for embeddings so we can decouple:
     # - chat/assessment LLM (for reasoning)
     # - embeddings model/provider (for pgvector retrieval)
-    embeddings_profile = getattr(settings, "embeddings_model_profile", None) or start.model_profile
+    requested_assessment_profile = _norm_profile_name(getattr(start, "model_profile", None))
+    requested_embeddings_profile = _norm_profile_name(getattr(settings, "embeddings_model_profile", None))
+
+    assessment_profile = _resolve_profile(
+        settings,
+        requested_assessment_profile,
+        fallback=getattr(settings, "default_assessment_profile", None),
+    )
+
+    embeddings_profile = _resolve_profile(
+        settings,
+        requested_embeddings_profile,
+        fallback=getattr(settings, "default_chat_profile", None) or assessment_profile,
+    )
 
     try:
-        llm = get_llm(start.model_profile)
+        llm = get_llm(assessment_profile)
         embed_llm = get_llm(embeddings_profile)
 
         # One-time embedding health check to fail fast if the embedding model/config is wrong.
@@ -300,16 +356,16 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
         expected_dim = getattr(settings, "embeddings_dim", None)
         if expected_dim and dim != int(expected_dim):
             raise LLMError(
-                f"Embedding dimension mismatch: got {dim}, expected {int(expected_dim)}. "
-                "Update EMBEDDINGS_DIM and/or your embedding model selection."
+                f"Embedding dimension mismatch: got {dim}, expected {int(expected_dim)} (embeddings_profile={embeddings_profile}). "
+                "Update EMBEDDINGS_DIM and/or your embeddings deployment/model profile (e.g., Azure Ada-002 deployment)."
             )
 
         await store.set_status(assessment_id, "running")
         logger.info(
-            "risk_assessment running (assessment_id=%s, clauses=%s, model_profile=%s, embeddings_profile=%s)",
+            "risk_assessment running (assessment_id=%s, clauses=%s, assessment_profile=%s, embeddings_profile=%s)",
             assessment_id,
             len(parse_result.clauses),
-            start.model_profile,
+            assessment_profile,
             embeddings_profile,
         )
 
@@ -451,7 +507,7 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                         messages=[sys, user],
                         schema=ClauseAssessment,
                         temperature=0.0,
-                        max_tokens=18000,
+                        max_tokens=MAX_ASSESSMENT_OUTPUT_TOKENS,
                     )
                     break
                 except Exception as e:
@@ -549,7 +605,7 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                     ChatMessage(role="user", content=summary_seed),
                 ],
                 temperature=0.1,
-                max_tokens=12000,
+                max_tokens=MAX_SUMMARY_OUTPUT_TOKENS,
             )
         except Exception:
             # Deterministic fallback

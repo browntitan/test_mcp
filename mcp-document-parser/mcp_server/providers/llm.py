@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import random
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Type, TypeVar, Union
@@ -22,42 +24,75 @@ def _strip_trailing_slash(url: str) -> str:
     return (url or "").strip().rstrip("/")
 
 
-def _json_extract(text: str) -> Any:
-    """Best-effort JSON extractor.
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
-    Models sometimes return fenced code blocks or extra prose. We try:
-      1) direct json.loads
-      2) fenced ```json ...```
-      3) first {...} block
+
+def _normalize_azure_endpoint(endpoint: str) -> tuple[str, bool]:
+    """Normalize Azure OpenAI endpoint and detect OpenAI v1-style routing.
+
+    Accepts endpoints like:
+      - https://{resource}.openai.azure.com
+      - https://{resource}.openai.azure.com/openai
+      - https://{resource}.openai.azure.com/openai/v1
+
+    Returns:
+      (normalized_endpoint, is_v1)
+
+    Notes:
+      - For v1 endpoints, Azure still requires `api-version` as a query parameter.
     """
 
-    raw = (text or "").strip()
-    if not raw:
-        raise ValueError("Empty response")
+    ep = _strip_trailing_slash(endpoint)
+    if not ep:
+        return "", False
 
-    # 1) direct
+    # Detect /openai/v1 style base URLs.
+    if re.search(r"/openai/v1$", ep, flags=re.IGNORECASE):
+        return ep, True
+
+    # Strip a trailing /openai if someone included it.
+    ep = re.sub(r"/openai$", "", ep, flags=re.IGNORECASE)
+    ep = _strip_trailing_slash(ep)
+    return ep, False
+
+
+def _header_request_ids(headers: httpx.Headers) -> Dict[str, str]:
+    """Extract common request/correlation IDs for easier debugging."""
+    keys = [
+        "x-ms-request-id",
+        "x-request-id",
+        "apim-request-id",
+        "x-correlation-id",
+        "traceparent",
+    ]
+    out: Dict[str, str] = {}
+    for k in keys:
+        v = headers.get(k)
+        if v:
+            out[k] = v
+    return out
+
+
+def _parse_retry_after_seconds(headers: httpx.Headers) -> Optional[float]:
+    ra = headers.get("retry-after")
+    if not ra:
+        return None
     try:
-        return json.loads(raw)
+        # Most common: integer seconds
+        return float(str(ra).strip())
     except Exception:
-        pass
+        return None
 
-    # 2) fenced block
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL | re.IGNORECASE)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except Exception:
-            pass
 
-    # 3) first object block
-    m2 = re.search(r"(\{.*\})", raw, flags=re.DOTALL)
-    if m2:
-        try:
-            return json.loads(m2.group(1))
-        except Exception:
-            pass
+async def _sleep_backoff(attempt: int, *, base_s: float, max_s: float, retry_after_s: Optional[float] = None) -> None:
+    if retry_after_s is not None and retry_after_s > 0:
+        await asyncio.sleep(min(float(retry_after_s), float(max_s)))
+        return
 
-    raise ValueError("Could not parse JSON from model output")
+    # Exponential backoff with jitter.
+    exp = float(base_s) * (2.0 ** max(0, int(attempt)))
+    jitter = 0.5 + random.random()  # 0.5..1.5
+    await asyncio.sleep(min(exp * jitter, float(max_s)))
 
 
 @dataclass(frozen=True)
@@ -93,8 +128,34 @@ class LLMClient:
         timeout_s: float = 60.0,
     ) -> None:
         self.profile = profile
-        self.timeout_s = float(timeout_s)
-        self._client = httpx.AsyncClient(timeout=self.timeout_s, headers=self._base_headers())
+
+        # Allow future config-driven tuning without breaking older profiles.
+        self.timeout_s = float(getattr(profile, "timeout_s", None) or getattr(profile, "timeout_seconds", None) or timeout_s)
+        self.max_retries = int(getattr(profile, "max_retries", None) or 3)
+        self.retry_backoff_base_s = float(getattr(profile, "retry_backoff_base_s", None) or 0.5)
+        self.retry_backoff_max_s = float(getattr(profile, "retry_backoff_max_s", None) or 8.0)
+
+        # Azure endpoint normalization + v1 detection (OpenAI v1-style routing).
+        self._azure_base: str = ""
+        self._azure_is_v1: bool = False
+        if self.profile.provider == "azure_openai":
+            self._azure_base, self._azure_is_v1 = _normalize_azure_endpoint(self.profile.azure_endpoint or "")
+
+        max_connections = int(getattr(profile, "max_connections", None) or 20)
+        max_keepalive = int(getattr(profile, "max_keepalive_connections", None) or 20)
+        keepalive_expiry = float(getattr(profile, "keepalive_expiry_s", None) or 30.0)
+
+        limits = httpx.Limits(
+            max_connections=max_connections,
+            max_keepalive_connections=max_keepalive,
+            keepalive_expiry=keepalive_expiry,
+        )
+
+        self._client = httpx.AsyncClient(
+            timeout=self.timeout_s,
+            headers=self._base_headers(),
+            limits=limits,
+        )
 
     def _base_headers(self) -> Dict[str, str]:
         h: Dict[str, str] = {}
@@ -129,9 +190,15 @@ class LLMClient:
             base = _strip_trailing_slash(self.profile.base_url or "")
             return f"{base}/chat/completions"
 
-        base = _strip_trailing_slash(self.profile.azure_endpoint or "")
+        base = self._azure_base or _strip_trailing_slash(self.profile.azure_endpoint or "")
         dep = self.profile.azure_deployment
         ver = self.profile.azure_api_version
+
+        # Azure OpenAI v1 routing uses OpenAI-style paths under /openai/v1, but still requires api-version.
+        if self._azure_is_v1:
+            return f"{base}/chat/completions?api-version={ver}"
+
+        # Legacy Azure OpenAI routing uses the deployment in the URL.
         return f"{base}/openai/deployments/{dep}/chat/completions?api-version={ver}"
 
     def _embeddings_url(self) -> str:
@@ -143,36 +210,106 @@ class LLMClient:
             base = _strip_trailing_slash(self.profile.base_url or "")
             return f"{base}/embeddings"
 
-        base = _strip_trailing_slash(self.profile.azure_endpoint or "")
-        dep = getattr(self.profile, "azure_embeddings_deployment", None) or self.profile.azure_deployment
+        base = self._azure_base or _strip_trailing_slash(self.profile.azure_endpoint or "")
+
+        dep = getattr(self.profile, "azure_embeddings_deployment", None)
+        if not dep or not str(dep).strip():
+            raise LLMError(
+                "Azure embeddings deployment is not configured. Set azure_embeddings_deployment (recommended: an Ada-002 deployment)."
+            )
+
         ver = getattr(self.profile, "azure_embeddings_api_version", None) or self.profile.azure_api_version
+
+        # Azure OpenAI v1 routing uses OpenAI-style paths under /openai/v1, but still requires api-version.
+        if self._azure_is_v1:
+            return f"{base}/embeddings?api-version={ver}"
+
+        # Legacy Azure OpenAI routing uses the deployment in the URL.
         return f"{base}/openai/deployments/{dep}/embeddings?api-version={ver}"
 
     def _default_chat_model(self) -> Optional[str]:
+        # For Azure v1 routing, Azure expects the *deployment name* in the payload `model` field.
+        if self.profile.provider == "azure_openai" and self._azure_is_v1:
+            return (self.profile.model or self.profile.azure_deployment)
         return self.profile.model
 
     def _default_embedding_model(self) -> Optional[str]:
         # Prefer dedicated embedding model if provided.
-        return getattr(self.profile, "embedding_model", None) or self.profile.model
+        emb_model = getattr(self.profile, "embedding_model", None) or self.profile.model
+        # For Azure v1 routing, default to using the embeddings deployment name.
+        if self.profile.provider == "azure_openai" and self._azure_is_v1:
+            return emb_model or getattr(self.profile, "azure_embeddings_deployment", None)
+        return emb_model
 
     async def _post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            resp = await self._client.post(url, json=payload)
-        except Exception as e:
-            raise LLMError(f"LLM request failed: {e}") from e
+        last_exc: Optional[Exception] = None
 
-        if resp.status_code >= 400:
-            body = resp.text
-            snippet = body[:1000] + ("…" if len(body) > 1000 else "")
-            model_used = payload.get("model")
-            raise LLMError(
-                f"LLM error {resp.status_code} url={url} model={model_used!r}: {snippet}"
-            )
+        for attempt in range(0, max(0, int(self.max_retries)) + 1):
+            try:
+                resp = await self._client.post(url, json=payload)
+            except Exception as e:
+                last_exc = e
+                # Retry network-ish errors.
+                if attempt < int(self.max_retries):
+                    await _sleep_backoff(
+                        attempt,
+                        base_s=self.retry_backoff_base_s,
+                        max_s=self.retry_backoff_max_s,
+                    )
+                    continue
+                raise LLMError(f"LLM request failed after retries: {e}") from e
 
-        try:
-            return resp.json()
-        except Exception as e:
-            raise LLMError(f"LLM returned non-JSON response: {e}; body={resp.text[:500]}") from e
+            # Retry on transient status codes.
+            if resp.status_code in _RETRYABLE_STATUS_CODES and attempt < int(self.max_retries):
+                retry_after = _parse_retry_after_seconds(resp.headers)
+                await _sleep_backoff(
+                    attempt,
+                    base_s=self.retry_backoff_base_s,
+                    max_s=self.retry_backoff_max_s,
+                    retry_after_s=retry_after,
+                )
+                continue
+
+            if resp.status_code >= 400:
+                model_used = payload.get("model")
+
+                # Best-effort parse of common error envelope.
+                err_code: Optional[str] = None
+                err_msg: Optional[str] = None
+                body_text = resp.text or ""
+                try:
+                    j = resp.json()
+                    if isinstance(j, dict):
+                        e = j.get("error")
+                        if isinstance(e, dict):
+                            if isinstance(e.get("code"), str):
+                                err_code = e.get("code")
+                            if isinstance(e.get("message"), str):
+                                err_msg = e.get("message")
+                        # Some gateways use {"message": "..."}
+                        if err_msg is None and isinstance(j.get("message"), str):
+                            err_msg = j.get("message")
+                except Exception:
+                    pass
+
+                req_ids = _header_request_ids(resp.headers)
+                req_ids_str = " ".join([f"{k}={v}" for k, v in req_ids.items()])
+
+                snippet = body_text[:1200] + ("…" if len(body_text) > 1200 else "")
+                core = err_msg or snippet
+
+                raise LLMError(
+                    f"LLM error {resp.status_code} url={url} provider={self.profile.provider} model={model_used!r} "
+                    f"code={err_code!r} {req_ids_str}: {core}"
+                )
+
+            try:
+                return resp.json()
+            except Exception as e:
+                raise LLMError(f"LLM returned non-JSON response: {e}; body={resp.text[:500]}") from e
+
+        # Should not happen, but be defensive.
+        raise LLMError(f"LLM request failed after retries: {last_exc}")
 
     # -------------------------
     # Chat
@@ -233,11 +370,22 @@ class LLMClient:
             "messages": _to_openai_messages([constraint, *messages]),
             "temperature": float(temperature),
             "max_tokens": int(max_tokens),
+            # Prefer JSON mode when supported; we fall back automatically if a provider rejects it.
+            "response_format": {"type": "json_object"},
         }
         if model_id:
             payload["model"] = model_id
 
-        data = await self._post_json(url, payload)
+        try:
+            data = await self._post_json(url, payload)
+        except LLMError as e:
+            # Some providers (or older API versions) reject response_format.
+            msg = str(e).lower()
+            if "response_format" in msg or "unsupported" in msg or "unrecognized" in msg:
+                payload.pop("response_format", None)
+                data = await self._post_json(url, payload)
+            else:
+                raise
 
         try:
             text = (data["choices"][0]["message"]["content"] or "").strip()
@@ -287,7 +435,9 @@ class LLMClient:
         payload: Dict[str, Any] = {
             "input": texts,
         }
-        if model_id:
+
+        # For Azure legacy embeddings endpoints (deployment in URL), do NOT send model unless explicitly provided.
+        if model_id and not (self.profile.provider == "azure_openai" and not self._azure_is_v1):
             payload["model"] = model_id
 
         data = await self._post_json(url, payload)

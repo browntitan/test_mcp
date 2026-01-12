@@ -15,6 +15,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from . import __version__
 from .config import get_settings
+from .providers.llm import ChatMessage, LLMError, get_llm
 from .schemas import (
     MCP_TOOLS,
     ClauseListNormalized,
@@ -32,6 +33,30 @@ from .schemas import (
 from .tools import MCP_TOOL_NAMES, normalize_clauses, parse_docx, parse_pdf, risk_assessment
 
 PROTOCOL_VERSION = "2024-11-05"
+
+
+def _resolve_profile_name(settings: Any, preferred: Optional[str], fallback: str) -> str:
+    """Resolve a model profile name against Settings.model_profiles.
+
+    Ensures /health/llm doesn't crash if a profile name is missing.
+    """
+
+    profiles = getattr(settings, "model_profiles", {}) or {}
+    p = (preferred or "").strip()
+    if p and p in profiles:
+        return p
+
+    fb = (fallback or "").strip()
+    if fb and fb in profiles:
+        return fb
+
+    for k in ("assessment", "embeddings", "chat"):
+        if k in profiles:
+            return k
+
+    if profiles:
+        return sorted(list(profiles.keys()))[0]
+    return "chat"
 
 
 def _configure_logging() -> None:
@@ -110,6 +135,107 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health() -> Dict[str, Any]:
         return {"status": "healthy", "version": __version__}
+
+
+    @app.on_event("startup")
+    async def _startup_log_profiles() -> None:
+        try:
+            s = get_settings()
+            profiles = list((getattr(s, "model_profiles", {}) or {}).keys())
+            log.info(
+                "server startup: model profiles configured",
+                profiles=profiles,
+                default_chat=getattr(s, "default_chat_profile", None),
+                default_assessment=getattr(s, "default_assessment_profile", None),
+                embeddings_profile=getattr(s, "embeddings_model_profile", None),
+                embeddings_dim=getattr(s, "embeddings_dim", None),
+            )
+        except Exception as e:
+            log.exception("server startup: failed to log model profiles", error=str(e))
+
+
+    @app.get("/health/llm")
+    async def health_llm() -> Dict[str, Any]:
+        """Validate configured LLM + embeddings connectivity.
+
+        This is especially useful for Azure OpenAI Gov debugging:
+        - Confirms chat deployment works
+        - Confirms embeddings deployment works
+        - Confirms embedding dimension matches EMBEDDINGS_DIM
+        """
+
+        s = get_settings()
+
+        assessment_profile = _resolve_profile_name(
+            s,
+            preferred=getattr(s, "default_assessment_profile", None),
+            fallback="assessment",
+        )
+
+        embeddings_profile = _resolve_profile_name(
+            s,
+            preferred=getattr(s, "embeddings_model_profile", None),
+            fallback="embeddings",
+        )
+
+        out: Dict[str, Any] = {
+            "status": "ok",
+            "version": __version__,
+            "assessment_profile": assessment_profile,
+            "embeddings_profile": embeddings_profile,
+            "embeddings_dim_expected": getattr(s, "embeddings_dim", None),
+            "chat": {"ok": False},
+            "embeddings": {"ok": False},
+        }
+
+        # Chat check
+        try:
+            llm = get_llm(assessment_profile)
+            txt = await llm.chat_text(
+                messages=[
+                    ChatMessage(role="system", content="Reply with 'ok'."),
+                    ChatMessage(role="user", content="ping"),
+                ],
+                temperature=0.0,
+                max_tokens=16,
+            )
+            out["chat"] = {
+                "ok": True,
+                "sample": (txt or "").strip()[:64],
+            }
+        except Exception as e:
+            out["status"] = "degraded"
+            out["chat"] = {"ok": False, "error": str(e)}
+
+        # Embeddings check
+        try:
+            el = get_llm(embeddings_profile)
+            vecs = await el.embed_texts("dimension check")
+            if not vecs or not vecs[0]:
+                raise LLMError("Embeddings endpoint returned no vectors")
+            dim = len(vecs[0])
+            exp = getattr(s, "embeddings_dim", None)
+            dim_ok = True
+            if exp is not None:
+                try:
+                    dim_ok = dim == int(exp)
+                except Exception:
+                    dim_ok = True
+
+            out["embeddings"] = {
+                "ok": True,
+                "dim": dim,
+                "dim_ok": dim_ok,
+            }
+            if exp is not None:
+                out["embeddings"]["expected_dim"] = int(exp)
+            if not dim_ok:
+                out["status"] = "degraded"
+        except Exception as e:
+            out["status"] = "degraded"
+            out["embeddings"] = {"ok": False, "error": str(e)}
+
+        return out
 
     # ------------------
     # Direct HTTP endpoints
