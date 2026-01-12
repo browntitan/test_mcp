@@ -564,6 +564,14 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
         except Exception:
             pass
 
+        # If we produced no clause results, treat this as a failure rather than a misleading "completed" run.
+        # The store warnings will contain the real reason (JSON/schema validation, LLM connectivity, etc.).
+        if not results:
+            raise RuntimeError(
+                "All clause assessments failed (no clause results produced). "
+                "Check assessment warnings for JSON parsing/schema validation/LLM failures."
+            )
+
         # Totals + summary
         totals: Dict[str, Any] = {
             "total": len(results),

@@ -1,14 +1,34 @@
+# secrets / env
+.env
+*.env
+.env.*
+!*.env.example
+
+# python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
 .venv/
 venv/
-.env
+.envrc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# git
 .git/
-.idea/
-.vscode/
+.gitignore
+
+# OS / editor
 .DS_Store
-tests/
+.vscode/
+.idea/
+
+# build artifacts
+dist/
+build/
+*.egg-info/
+
+# docs / misc
 *.log

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import asyncio
 import json
 import logging
@@ -12,6 +13,7 @@ from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
+
 
 from . import __version__
 from .config import get_settings
@@ -31,6 +33,19 @@ from .schemas import (
     to_jsonable,
 )
 from .tools import MCP_TOOL_NAMES, normalize_clauses, parse_docx, parse_pdf, risk_assessment
+
+# ------------------
+# Windows asyncio compatibility
+# ------------------
+# On Windows, the default ProactorEventLoop is incompatible with psycopg's async mode.
+# Setting the Selector event loop policy prevents warnings like:
+#   "Psycopg cannot use the 'ProactorEventLoop' to run in async mode"
+# This is safe on non-Windows platforms (no-op).
+if sys.platform.startswith("win"):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 PROTOCOL_VERSION = "2024-11-05"
 

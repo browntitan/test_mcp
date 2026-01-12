@@ -21,8 +21,66 @@ class LLMError(RuntimeError):
     pass
 
 
+
 def _strip_trailing_slash(url: str) -> str:
     return (url or "").strip().rstrip("/")
+
+
+def _strip_code_fences(s: str) -> str:
+    """Remove common markdown code fences from model output."""
+    s = (s or "").strip()
+    if s.startswith("```"):
+        # Drop leading ```json / ``` and trailing ```
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
+        s = re.sub(r"\s*```\s*$", "", s)
+    return s.strip()
+
+
+def _json_extract(text: str) -> Any:
+    """Extract a JSON object from text.
+
+    We try strict json.loads first, then fall back to extracting the first balanced
+    JSON object (handles occasional leading/trailing text).
+    """
+
+    s = _strip_code_fences(text)
+
+    # Fast path: exact JSON
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # Fallback: find the first balanced {...} object.
+    start = s.find("{")
+    if start < 0:
+        raise ValueError("No JSON object found in output")
+
+    depth = 0
+    in_str = False
+    esc = False
+
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = s[start : i + 1]
+                    return json.loads(candidate)
+
+    raise ValueError("Unterminated JSON object in output")
 
 
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
