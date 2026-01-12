@@ -160,24 +160,38 @@ class LLMClient:
         trust_env = True  # respect HTTPS_PROXY/HTTP_PROXY/NO_PROXY if set
 
         if self.profile.provider == "azure_openai":
+            # IMPORTANT:
+            # - Our .env is loaded by Pydantic Settings (get_settings()), which does NOT necessarily
+            #   populate os.environ. Therefore, prefer Settings for TLS options.
+            # - Allow real OS env vars to override when explicitly set (useful in containers/CI).
+            settings = get_settings()
+
             # Prefer a CA bundle over disabling verification.
-            ca_bundle = (
-                os.getenv("AZURE_OPENAI_CA_BUNDLE", "").strip()
-                or os.getenv("AZURE_CA_BUNDLE", "").strip()
-                or os.getenv("REQUESTS_CA_BUNDLE", "").strip()
-                or os.getenv("SSL_CERT_FILE", "").strip()
-            )
+            ca_bundle = (getattr(settings, "azure_openai_ca_bundle", None) or "").strip()
+            ca_bundle = ca_bundle or os.getenv("AZURE_OPENAI_CA_BUNDLE", "").strip()
+            ca_bundle = ca_bundle or os.getenv("AZURE_CA_BUNDLE", "").strip()
+            ca_bundle = ca_bundle or os.getenv("REQUESTS_CA_BUNDLE", "").strip()
+            ca_bundle = ca_bundle or os.getenv("SSL_CERT_FILE", "").strip()
+
             if ca_bundle:
                 verify = ca_bundle
             else:
-                # Explicit opt-out switch (use only when you cannot install the corp CA bundle).
-                v = (
-                    os.getenv("AZURE_OPENAI_SSL_VERIFY", "").strip()
-                    or os.getenv("AZURE_SSL_VERIFY", "").strip()
-                    or os.getenv("SSL_VERIFY", "").strip()
-                )
-                if v.lower() in ("0", "false", "no", "off"):
-                    verify = False
+                # Settings boolean controls verify when no CA bundle is provided.
+                verify_flag = bool(getattr(settings, "azure_openai_ssl_verify", True))
+
+                # Optional OS env override (only if explicitly set at runtime)
+                v = os.getenv("AZURE_OPENAI_SSL_VERIFY", "").strip()
+                if not v:
+                    v = os.getenv("AZURE_SSL_VERIFY", "").strip() or os.getenv("SSL_VERIFY", "").strip()
+
+                if v:
+                    vv = v.lower()
+                    if vv in ("0", "false", "no", "off"):
+                        verify_flag = False
+                    elif vv in ("1", "true", "yes", "on"):
+                        verify_flag = True
+
+                verify = verify_flag
 
         self._client = httpx.AsyncClient(
             timeout=self.timeout_s,

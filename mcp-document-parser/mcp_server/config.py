@@ -90,8 +90,7 @@ class ModelProfile(BaseModel):
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
-    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
-
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore", env_file=".env", env_file_encoding="utf-8")
     # -----------------
     # Server
     # -----------------
@@ -149,6 +148,14 @@ class Settings(BaseSettings):
     # Optional separate Azure embeddings deployment/version
     azure_openai_embeddings_deployment: Optional[str] = Field(default=None, alias="AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT")
     azure_openai_embeddings_api_version: Optional[str] = Field(default=None, alias="AZURE_OPENAI_EMBEDDINGS_API_VERSION")
+
+    # -----------------
+    # Azure TLS / cert behavior
+    # -----------------
+    # These are used by providers/llm.py to decide whether to verify TLS certificates
+    # and/or which CA bundle to trust when calling Azure endpoints.
+    azure_openai_ssl_verify: bool = Field(default=False, alias="AZURE_OPENAI_SSL_VERIFY")
+    azure_openai_ca_bundle: Optional[str] = Field(default=None, alias="AZURE_OPENAI_CA_BUNDLE")
 
     # Parsed profiles
     model_profiles: Dict[str, ModelProfile] = Field(default_factory=dict)
