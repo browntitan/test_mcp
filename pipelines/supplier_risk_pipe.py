@@ -9,7 +9,10 @@ import base64
 import os
 import time
 import asyncio
-from typing import Dict, Generator, List, Optional, Tuple
+import csv
+import io
+from datetime import datetime
+from typing import Dict, Generator, List, Optional, Tuple, Any
 
 import requests
 from pydantic import BaseModel, Field
@@ -20,6 +23,10 @@ class Pipeline:
         # From Pipelines container -> host port 3000 -> OpenWebUI container 8080
         OPENWEBUI_BASE_URL: str = Field(default="http://host.docker.internal:3000")
         OPENWEBUI_API_KEY: str = Field(default="")
+
+        # The URL users can click in the browser (often http://localhost:3000 or your DNS name).
+        # If empty, we'll try to derive it from OPENWEBUI_BASE_URL.
+        OPENWEBUI_PUBLIC_BASE_URL: str = Field(default="")
 
         # MCP server reachable from Pipelines container
         MCP_BASE_URL: str = Field(default="http://host.docker.internal:8765")
@@ -38,6 +45,13 @@ class Pipeline:
         HTTP_TIMEOUT_S: float = Field(default=180.0, ge=10.0, le=600.0)
 
         DEBUG: bool = Field(default=True)
+
+        MAX_UI_CHUNK_CHARS: int = Field(default=8000, ge=1024, le=200000)
+
+        # Export a CSV file containing per-clause results and upload it to OpenWebUI for download.
+        EXPORT_CSV: bool = Field(default=True)
+        CSV_INCLUDE_TEXT_WITH_CHANGES: bool = Field(default=True)
+        CSV_MAX_TEXT_CHARS: int = Field(default=50000, ge=0, le=500000)
 
     def __init__(self):
         self.name = "Supplier Risk Assessment (MCP)"
@@ -158,21 +172,163 @@ class Pipeline:
             raise ValueError("Downloaded file content was empty.")
         return r.content
 
-    def _mcp_post(self, path: str, payload: dict) -> dict:
-        url = self.valves.MCP_BASE_URL.rstrip("/") + path
-        r = requests.post(url, json=payload, timeout=float(self.valves.HTTP_TIMEOUT_S))
+    def _public_base_url(self) -> str:
+        """Return the base URL that the end-user's browser can reach."""
+        pub = (self.valves.OPENWEBUI_PUBLIC_BASE_URL or "").strip()
+        if pub:
+            return pub.rstrip("/")
+
+        base = (self.valves.OPENWEBUI_BASE_URL or "").strip().rstrip("/")
+        # Heuristic: pipelines often uses host.docker.internal, but users access localhost or a DNS name.
+        if "host.docker.internal" in base:
+            return base.replace("host.docker.internal", "localhost")
+        return base
+
+    def _owui_upload_bytes(self, filename: str, blob: bytes, content_type: str) -> str:
+        """Upload a generated file to OpenWebUI so the user can download it."""
+        base = self.valves.OPENWEBUI_BASE_URL.rstrip("/")
+        # Avoid ingesting the report into RAG; we just want it downloadable.
+        url = base + "/api/v1/files/?process=false&process_in_background=false"
+        headers = self._owui_headers()
+        files = {"file": (filename, blob, content_type)}
+        r = requests.post(url, headers=headers, files=files, timeout=float(self.valves.HTTP_TIMEOUT_S))
         r.raise_for_status()
         data = r.json()
-        if not isinstance(data, dict):
-            raise ValueError(f"MCP response for {path} was not an object")
-        return data
 
-    def _status_details(self, title: str, body: str = "", done: bool = False) -> str:
-        d = "true" if done else "false"
-        body = (body or "").strip()
-        if body:
-            body = "\n\n" + body + "\n"
-        return f'<details type="status" done="{d}">\n<summary>{title}</summary>{body}</details>\n'
+        # Try common response shapes.
+        file_id = None
+        if isinstance(data, dict):
+            file_id = data.get("id") or data.get("file_id")
+            if not file_id and isinstance(data.get("file"), dict):
+                file_id = data["file"].get("id")
+
+        if not file_id:
+            raise ValueError(f"OpenWebUI file upload returned unexpected response: {data}")
+        return str(file_id)
+
+    def _as_assessment(self, item: Any) -> dict:
+        """Handle ClauseAssessment vs ClauseRiskResult shapes."""
+        if isinstance(item, dict) and isinstance(item.get("assessment"), dict):
+            return item["assessment"]
+        if isinstance(item, dict):
+            return item
+        return {}
+
+    def _get_text_with_changes(self, item: Any) -> str:
+        if isinstance(item, dict):
+            v = item.get("text_with_changes") or item.get("clause_text") or item.get("text")
+            return (v or "")
+        return ""
+
+    def _build_csv_bytes(self, assessment_id: str, rep_json: dict) -> bytes:
+        """Build a CSV export from the JSON report."""
+        summary = (rep_json.get("summary") or "").strip()
+        totals = rep_json.get("totals") or {}
+        clause_results = rep_json.get("clause_results") or []
+
+        include_text = bool(self.valves.CSV_INCLUDE_TEXT_WITH_CHANGES)
+        max_text = int(self.valves.CSV_MAX_TEXT_CHARS or 0)
+
+        buf = io.StringIO(newline="")
+        w = csv.writer(buf)
+
+        # Header metadata rows (CSV-friendly)
+        w.writerow(["assessment_id", assessment_id])
+        w.writerow(["generated_at", datetime.utcnow().isoformat() + "Z"])
+        if totals:
+            w.writerow(["totals", str(totals)])
+        if summary:
+            w.writerow(["summary", summary])
+        w.writerow([])
+
+        # Column headers
+        headers = [
+            "clause_id",
+            "label",
+            "title",
+            "risk_level",
+            "risk_score",
+            "justification",
+            "issues",
+            "citations",
+            "recommended_redline",
+        ]
+        if include_text:
+            headers.append("text_with_changes")
+        w.writerow(headers)
+
+        for item in clause_results:
+            a = self._as_assessment(item)
+            clause_id = str(a.get("clause_id") or "")
+            label = str(a.get("label") or "")
+            title = str(a.get("title") or "")
+            risk_level = str(a.get("risk_level") or "")
+            risk_score = a.get("risk_score")
+            try:
+                risk_score = int(risk_score)
+            except Exception:
+                risk_score = ""
+
+            justification = (a.get("justification") or "")
+
+            # Flatten issues
+            issues_list = a.get("issues") or []
+            issues_parts: List[str] = []
+            if isinstance(issues_list, list):
+                for it in issues_list:
+                    if not isinstance(it, dict):
+                        continue
+                    sev = (it.get("severity") or "").strip()
+                    cat = (it.get("category") or "").strip()
+                    desc = (it.get("description") or "").strip()
+                    if sev or cat or desc:
+                        issues_parts.append(f"{sev}|{cat}|{desc}")
+            issues = " ; ".join(issues_parts)
+
+            # Flatten citations
+            cits_list = a.get("citations") or []
+            cits_parts: List[str] = []
+            if isinstance(cits_list, list):
+                for c in cits_list:
+                    if not isinstance(c, dict):
+                        continue
+                    pid = (c.get("policy_id") or "").strip()
+                    chid = (c.get("chunk_id") or "").strip()
+                    score = c.get("score")
+                    try:
+                        score_s = f"{float(score):.3f}"
+                    except Exception:
+                        score_s = ""
+                    txt = (c.get("text") or "").strip().replace("\n", " ")
+                    if len(txt) > 260:
+                        txt = txt[:259] + "…"
+                    if pid or chid or txt:
+                        cits_parts.append(f"{pid}|{chid}|{score_s}|{txt}")
+            citations = " ; ".join(cits_parts)
+
+            recommended_redline = (a.get("recommended_redline") or "")
+
+            row = [
+                clause_id,
+                label,
+                title,
+                risk_level,
+                risk_score,
+                justification,
+                issues,
+                citations,
+                recommended_redline,
+            ]
+
+            if include_text:
+                txt = self._get_text_with_changes(item)
+                if max_text and len(txt) > max_text:
+                    txt = txt[: max_text - 1] + "…"
+                row.append(txt)
+
+            w.writerow(row)
+
+        return buf.getvalue().encode("utf-8")
 
     # -------------------------
     # Main pipeline
@@ -250,6 +406,8 @@ class Pipeline:
                     time.sleep(float(self.valves.POLL_INTERVAL_S))
 
                 yield "\nFetching report…\n\n"
+
+                # Primary report (often markdown)
                 rep = self._mcp_post(
                     "/tools/risk_assessment/report",
                     {"assessment_id": assessment_id, "format": self.valves.REPORT_FORMAT},
@@ -258,8 +416,36 @@ class Pipeline:
                 if not content:
                     content = f"Assessment {assessment_id} finished, but report text was empty."
 
+                csv_download_url = ""
+                if bool(self.valves.EXPORT_CSV):
+                    # Always fetch JSON for export (best structured source)
+                    rep_json = self._mcp_post(
+                        "/tools/risk_assessment/report",
+                        {"assessment_id": assessment_id, "format": "json"},
+                    )
+
+                    csv_bytes = self._build_csv_bytes(assessment_id, rep_json)
+                    csv_name = f"risk_report_{assessment_id}.csv"
+                    file_id2 = self._owui_upload_bytes(csv_name, csv_bytes, "text/csv")
+
+                    pub = self._public_base_url()
+                    csv_download_url = f"{pub}/api/v1/files/{file_id2}/content"
+
                 yield self._status_details("Done", f"id={assessment_id}", done=True)
-                yield content + "\n"
+
+                # Provide a download link first (if generated)
+                if csv_download_url:
+                    link_text = (
+                        "\n\n✅ CSV export generated. Download here:\n"
+                        f"{csv_download_url}\n\n"
+                    )
+                    for part in self._iter_text_chunks(link_text, int(self.valves.MAX_UI_CHUNK_CHARS)):
+                        yield part
+
+                # Stream the final report in smaller chunks to avoid OpenWebUI "Chunk too big".
+                for part in self._iter_text_chunks(content, int(self.valves.MAX_UI_CHUNK_CHARS)):
+                    yield part
+                yield "\n"
 
             except Exception as e:
                 yield self._status_details("Error", str(e), done=True)
