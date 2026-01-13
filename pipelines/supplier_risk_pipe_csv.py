@@ -173,6 +173,22 @@ class Pipeline:
             raise ValueError("Downloaded file content was empty.")
         return r.content
 
+    def _mcp_post(self, path: str, payload: dict) -> dict:
+        url = self.valves.MCP_BASE_URL.rstrip("/") + path
+        r = requests.post(url, json=payload, timeout=float(self.valves.HTTP_TIMEOUT_S))
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, dict):
+            raise ValueError(f"MCP response for {path} was not an object")
+        return data
+
+    def _status_details(self, title: str, body: str = "", done: bool = False) -> str:
+        d = "true" if done else "false"
+        body = (body or "").strip()
+        if body:
+            body = "\n\n" + body + "\n"
+        return f'<details type="status" done="{d}">\n<summary>{title}</summary>{body}</details>\n'
+
     def _public_base_url(self) -> str:
         """Return the base URL that the end-user's browser can reach."""
         pub = (self.valves.OPENWEBUI_PUBLIC_BASE_URL or "").strip()
