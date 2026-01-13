@@ -205,7 +205,7 @@ class Pipeline:
         base = self.valves.OPENWEBUI_BASE_URL.rstrip("/")
         # Avoid ingesting into RAG; we just want it downloadable.
         url = base + "/api/v1/files/?process=false&process_in_background=false"
-        headers = self._owui_headers()
+        headers = {**self._owui_headers(), "Accept": "application/json"}
         files = {"file": (filename, blob, content_type)}
         r = requests.post(url, headers=headers, files=files, timeout=float(self.valves.HTTP_TIMEOUT_S))
         r.raise_for_status()
@@ -443,6 +443,8 @@ class Pipeline:
                     content = f"Assessment {assessment_id} finished, but report text was empty."
 
                 csv_download_url = ""
+                csv_download_path = ""  # relative path is most reliable inside OpenWebUI
+                csv_filename = ""
                 if bool(self.valves.EXPORT_CSV):
                     yield self._status_details("Export", "Generating CSV…", done=False)
 
@@ -453,24 +455,32 @@ class Pipeline:
                     )
 
                     csv_bytes = self._build_csv_bytes(assessment_id, rep_json)
-                    csv_name = f"risk_report_{assessment_id}.csv"
-                    file_id2 = self._owui_upload_bytes(csv_name, csv_bytes, "text/csv")
+                    csv_filename = f"risk_report_{assessment_id}.csv"
+                    file_id2 = self._owui_upload_bytes(csv_filename, csv_bytes, "text/csv")
 
+                    # Relative path works best for end users (same-origin in the browser)
+                    csv_download_path = f"/api/v1/files/{file_id2}/content"
+
+                    # Absolute URL is optional and depends on correct public base url
                     pub = self._public_base_url()
-                    csv_download_url = f"{pub}/api/v1/files/{file_id2}/content"
+                    if pub:
+                        csv_download_url = f"{pub}{csv_download_path}"
 
-                    yield self._status_details("Export", "CSV uploaded.", done=False)
+                    yield self._status_details("Export", f"CSV uploaded (file_id={file_id2}).", done=False)
 
                 yield self._status_details("Done", f"id={assessment_id}", done=True)
 
-                # Provide CSV download link first
-                if csv_download_url:
-                    link_text = (
-                        "\n\n✅ CSV export generated. Download here:\n"
-                        f"{csv_download_url}\n\n"
-                    )
-                    for part in self._iter_text_chunks(link_text, int(self.valves.MAX_UI_CHUNK_CHARS)):
-                        yield part
+                # Provide CSV download link first (use relative link for reliability)
+                if csv_download_path:
+                    # Markdown link so it's clickable in the UI
+                    link_text = f"\n\n✅ CSV export generated.\n📄 Download: [{csv_filename or 'risk_report.csv'}]({csv_download_path})\n"
+                    if csv_download_url:
+                        # Also show the absolute URL for environments where users need it
+                        link_text += f"Direct URL: {csv_download_url}\n"
+                    link_text += "\n"
+
+                    # This message is short; yield it as-is (avoid splitting the URL).
+                    yield link_text
 
                 # Stream the final report in smaller chunks to avoid OpenWebUI streaming limits.
                 for part in self._iter_text_chunks(content, int(self.valves.MAX_UI_CHUNK_CHARS)):
