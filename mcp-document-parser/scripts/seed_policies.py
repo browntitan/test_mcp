@@ -126,6 +126,8 @@ def discover_files(input_dir: Path) -> List[Path]:
     exts = {".txt", ".md"}
     out: List[Path] = []
     for p in sorted(input_dir.rglob("*")):
+        if any(part.startswith(".") for part in p.parts):
+            continue
         if p.is_file() and p.suffix.lower() in exts:
             out.append(p)
     return out
@@ -152,6 +154,80 @@ def first_heading(text: str) -> Optional[str]:
     return None
 
 
+FILENAME_CLAUSE_RE = re.compile(
+    r"^\s*(?P<num>\d+(?:\.\d+)*)\s*[\.)\-:]?\s*(?P<title>.*?)(?:\s*\[(?P<termsets>[^\]]+)\]\s*)?$"
+)
+
+
+def _expand_termset_token(tok: str) -> List[str]:
+    """Expand tokens like '001', '1', '001-004', '1-3' into zero-padded 3-digit strings."""
+    tok = (tok or "").strip()
+    if not tok:
+        return []
+
+    # normalize separators
+    tok = tok.replace("–", "-").replace("—", "-")
+
+    # range like 001-004
+    if "-" in tok:
+        a, b = [t.strip() for t in tok.split("-", 1)]
+        if a.isdigit() and b.isdigit():
+            ia, ib = int(a), int(b)
+            if ia <= ib:
+                return [f"{i:03d}" for i in range(ia, ib + 1)]
+            return [f"{i:03d}" for i in range(ib, ia + 1)]
+        return []
+
+    if tok.isdigit():
+        return [f"{int(tok):03d}"]
+
+    return []
+
+
+def parse_policy_filename(name: str) -> Dict[str, Any]:
+    """Parse filenames like:
+
+    - '1. Definitions'
+    - '2. Order Acceptance [001,002,003]'
+    - '2. Order Acceptance [001-004]'
+
+    Returns metadata fields used later for deterministic filtering.
+    """
+    stem = (name or "").strip()
+    m = FILENAME_CLAUSE_RE.match(stem)
+    if not m:
+        # If it doesn't match the convention, treat as global guidance.
+        return {
+            "clause_number": None,
+            "clause_title": stem[:200] or None,
+            "termsets": [],
+            "applies_to_all_termsets": True,
+        }
+
+    clause_number = (m.group("num") or "").strip() or None
+    clause_title = (m.group("title") or "").strip() or None
+
+    raw_termsets = (m.group("termsets") or "").strip()
+    termsets: List[str] = []
+    if raw_termsets:
+        # split by comma/space/semicolon
+        tokens = re.split(r"[\s,;]+", raw_termsets)
+        for tok in tokens:
+            termsets.extend(_expand_termset_token(tok))
+        # de-dupe while preserving order
+        seen: set[str] = set()
+        termsets = [t for t in termsets if not (t in seen or seen.add(t))]
+
+    applies_all = len(termsets) == 0
+
+    return {
+        "clause_number": clause_number,
+        "clause_title": (clause_title[:200] if clause_title else None),
+        "termsets": termsets,
+        "applies_to_all_termsets": applies_all,
+    }
+
+
 async def embed_batch(profile: str, texts: List[str], expected_dim: Optional[int]) -> List[List[float]]:
     llm = get_llm(profile)
     embs = await llm.embed_texts(texts)
@@ -167,6 +243,8 @@ async def embed_batch(profile: str, texts: List[str], expected_dim: Optional[int
 def ensure_schema(conn: psycopg.Connection, dim: int) -> None:
     with conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+
+        # Create table if missing
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS policy_chunks (
@@ -181,7 +259,49 @@ def ensure_schema(conn: psycopg.Connection, dim: int) -> None:
             );
             """
         )
+
+        # If table already existed, confirm embedding dim matches requested dim.
+        # We use format_type to get a string like 'vector(1536)'.
+        cur.execute(
+            """
+            SELECT format_type(a.atttypid, a.atttypmod)
+            FROM pg_attribute a
+            WHERE a.attrelid = 'policy_chunks'::regclass
+              AND a.attname = 'embedding'
+              AND a.attnum > 0
+              AND NOT a.attisdropped;
+            """
+        )
+        row = cur.fetchone()
+        if row and isinstance(row[0], str):
+            ft = row[0]
+            m = re.search(r"vector\((\d+)\)", ft)
+            if m:
+                existing_dim = int(m.group(1))
+                if existing_dim != dim:
+                    raise SystemExit(
+                        "\n".join(
+                            [
+                                f"Embedding dim mismatch in DB schema: policy_chunks.embedding is vector({existing_dim}) but you requested dim={dim}.",
+                                "Fix options:",
+                                "  1) Re-run seed with --dim matching the existing table; or",
+                                "  2) Drop/migrate the table and recreate it with the new dimension (recommended when moving 768 -> 1536).",
+                                "     Example: DROP TABLE policy_chunks; then re-run seed.",
+                            ]
+                        )
+                    )
+
         cur.execute("CREATE INDEX IF NOT EXISTS policy_chunks_collection_idx ON policy_chunks (collection);")
+
+        # Helpful for metadata filtering (clause_number, termsets, etc.)
+        cur.execute("CREATE INDEX IF NOT EXISTS policy_chunks_metadata_gin ON policy_chunks USING gin (metadata);")
+
+        # Optional functional index to speed clause_number filtering
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS policy_chunks_clause_number_idx "
+            "ON policy_chunks ((metadata->>'clause_number'));"
+        )
+
         # HNSW cosine index (requires vector(dim))
         cur.execute(
             "CREATE INDEX IF NOT EXISTS policy_chunks_embedding_hnsw "
@@ -276,6 +396,7 @@ async def main() -> None:
             text = read_text(f)
             title = first_heading(text) or f.stem
             policy_id = policy_id_from_path(f)
+            filename_meta = parse_policy_filename(f.stem)
 
             chunks = chunk_text(text, chunk_size=args.chunk_size, overlap=args.overlap)
             if not chunks:
@@ -301,6 +422,11 @@ async def main() -> None:
                     "title": title,
                     "chunk_index": idx,
                     "chunk_count": len(chunks),
+                    # Deterministic association fields
+                    "clause_number": filename_meta.get("clause_number"),
+                    "clause_title": filename_meta.get("clause_title"),
+                    "termsets": filename_meta.get("termsets", []),
+                    "applies_to_all_termsets": bool(filename_meta.get("applies_to_all_termsets", False)),
                 }
                 upsert_chunk(
                     conn,

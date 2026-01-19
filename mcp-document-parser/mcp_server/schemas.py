@@ -356,6 +356,30 @@ class RiskAssessmentStartInput(BaseModel):
     min_score: Optional[float] = None
     filters: Dict[str, Any] = Field(default_factory=dict)
 
+    # Optional term set identifier used to deterministically match internal guidance.
+    # Accepts values like "003" or "3"; numeric values are normalized to 3-digit strings.
+    termset_id: Optional[str] = None
+
+    @field_validator("termset_id", mode="before")
+    @classmethod
+    def _normalize_termset_id(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            try:
+                return f"{int(v):03d}"
+            except Exception:
+                return None
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            if s.isdigit():
+                return f"{int(s):03d}"
+            # If caller passes a non-numeric token, preserve it as-is.
+            return s
+        return v
+
     # Model selection
     # "chat" means use the chat/default model profile.
     # "assessment" means use the assessment model profile (enterprise).
@@ -582,6 +606,10 @@ MCP_TOOLS: List[Dict[str, Any]] = [
                 "top_k": {"type": "integer", "default": 3, "minimum": 1, "maximum": 50},
                 "min_score": {"type": "number"},
                 "filters": {"type": "object"},
+                "termset_id": {
+                    "type": "string",
+                    "description": "Optional term set id used to match internal guidance (e.g., '003' or '3'). Numeric values are normalized to 3 digits.",
+                },
                 "model_profile": {"type": "string", "default": "assessment"},
                 "focus_clause_ids": {"type": "array", "items": {"type": "string"}},
                 "concurrency": {"type": "integer", "default": 2, "minimum": 1, "maximum": 16},

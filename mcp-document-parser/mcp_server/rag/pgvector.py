@@ -154,6 +154,23 @@ def _build_filter_sql(filters: Dict[str, Any], cfg: PgVectorSearchConfig) -> Tup
         clauses.append(f"{cfg.policy_id_column} = %(policy_id)s")
         params["policy_id"] = str(filters["policy_id"])
 
+    # Termset membership filter
+    # filters["termset"] is treated specially:
+    #   include rows where applies_to_all_termsets is true (or missing)
+    #   OR termsets contains the termset id as a string element.
+    if "termset" in filters and filters["termset"] is not None:
+        ts_raw = str(filters["termset"]).strip()
+        if ts_raw:
+            # Normalize numeric termsets to 3-digit strings to match seeding (e.g., "3" -> "003").
+            if ts_raw.isdigit():
+                ts_raw = f"{int(ts_raw):03d}"
+
+            clauses.append(
+                "(COALESCE((" + cfg.metadata_column + " ->> 'applies_to_all_termsets')::boolean, true) = true "
+                " OR (" + cfg.metadata_column + " -> 'termsets') ? %(termset)s)"
+            )
+            params["termset"] = ts_raw
+
     # Metadata filters via nested dict
     md = filters.get("metadata")
     if isinstance(md, dict):
@@ -167,7 +184,7 @@ def _build_filter_sql(filters: Dict[str, Any], cfg: PgVectorSearchConfig) -> Tup
 
     # Any remaining keys treated as metadata key equality
     for k, v in filters.items():
-        if k in ("policy_id", "collection", "metadata"):
+        if k in ("policy_id", "collection", "metadata", "termset"):
             continue
         if v is None:
             continue
@@ -289,7 +306,9 @@ class PgVectorPolicyRetriever:
 
         # Score definition: 1 - cosine_distance
         # Distance operator '<=>' is cosine distance in pgvector.
-        distance_expr = f"{embedding_col} {cfg.distance_operator} (%(qvec)s)::vector"
+        expected_dim = getattr(settings, "embeddings_dim", None)
+        vec_cast = f"::vector({int(expected_dim)})" if expected_dim else "::vector"
+        distance_expr = f"{embedding_col} {cfg.distance_operator} (%(qvec)s){vec_cast}"
         score_expr = f"(1 - ({distance_expr}))"
 
         where_clause = f"{collection_col} = %(collection)s{filter_sql}"

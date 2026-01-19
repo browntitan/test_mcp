@@ -29,7 +29,22 @@ from ...tools.parse_pdf import parse_pdf
 from ...workflows.risk_assessment.store import get_store
 
 
+
 logger = logging.getLogger(__name__)
+
+_CLAUSE_NUMBER_RE = re.compile(r"^\s*(\d+(?:\.\d+)*)")
+
+
+def _extract_clause_number(label: Optional[str]) -> Optional[str]:
+    """Extract a canonical clause number from labels like '2', '2.', '2.1', '2.1.'"""
+    if not label:
+        return None
+    s = str(label).strip()
+    if not s:
+        return None
+    s = s.rstrip(".")
+    m = _CLAUSE_NUMBER_RE.match(s)
+    return m.group(1) if m else None
 
 # Prompt-size guards to reduce truncated/invalid JSON responses.
 MAX_CLAUSE_CHARS = 14000
@@ -427,17 +442,68 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
             except Exception as e:
                 await store.add_warning(assessment_id, f"Failed to store clause text for clause_id={cid}: {e}")
 
-            # Retrieve policy context via pgvector
+            # Retrieve policy context via pgvector.
+            # We deterministically narrow guidance by clause_number and (optionally) termset.
             citations: List[PolicyCitation] = []
             try:
+                base_filters: Dict[str, Any] = dict(start.filters or {})
+
+                clause_number = _extract_clause_number(getattr(clause, "label", None))
+                if clause_number:
+                    base_filters["clause_number"] = clause_number
+
+                # NOTE: pgvector retriever expects the special key "termset" (not "termset_id").
+                termset_id = getattr(start, "termset_id", None)
+                if termset_id:
+                    base_filters["termset"] = termset_id
+
                 citations = await search_policies(
                     clause_text,
                     collection=start.policy_collection,
                     top_k=start.top_k,
                     min_score=start.min_score,
-                    filters=start.filters,
+                    filters=base_filters,
                     embedder=embed_query,
                 )
+
+                # Fallback 1: If a termset was provided but no citations matched, retry without termset.
+                if (not citations) and termset_id and ("termset" in base_filters):
+                    fallback_filters = dict(base_filters)
+                    fallback_filters.pop("termset", None)
+                    citations = await search_policies(
+                        clause_text,
+                        collection=start.policy_collection,
+                        top_k=start.top_k,
+                        min_score=start.min_score,
+                        filters=fallback_filters,
+                        embedder=embed_query,
+                    )
+                    if citations:
+                        await store.add_warning(
+                            assessment_id,
+                            f"No termset-specific guidance found; used clause-only guidance for clause_id={cid} (termset_id={termset_id}).",
+                        )
+
+                # Fallback 2: If clause-number narrowing yields nothing, retry with only the caller-provided filters.
+                if not citations and clause_number:
+                    fallback_filters2: Dict[str, Any] = dict(start.filters or {})
+                    # Keep termset if provided (it can still narrow to global guidance).
+                    if termset_id:
+                        fallback_filters2["termset"] = termset_id
+                    citations = await search_policies(
+                        clause_text,
+                        collection=start.policy_collection,
+                        top_k=start.top_k,
+                        min_score=start.min_score,
+                        filters=fallback_filters2,
+                        embedder=embed_query,
+                    )
+                    if citations:
+                        await store.add_warning(
+                            assessment_id,
+                            f"No clause-number-specific guidance found; used broader guidance for clause_id={cid} (clause_number={clause_number}).",
+                        )
+
             except Exception as e:
                 await store.add_warning(assessment_id, f"Policy retrieval failed for clause_id={cid}: {e}")
                 citations = []

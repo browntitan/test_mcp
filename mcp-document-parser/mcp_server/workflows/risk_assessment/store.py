@@ -46,6 +46,10 @@ class _AssessmentRecord:
     # High-level document info
     document: Dict[str, Any] = field(default_factory=dict)
 
+    # Snapshot of RAG / retrieval configuration used for this assessment run
+    # (policy_collection, termset_id, filters, top_k, min_score, embeddings settings, etc.)
+    rag: Dict[str, Any] = field(default_factory=dict)
+
     # Clause execution plan
     clause_ids: List[str] = field(default_factory=list)
 
@@ -119,6 +123,7 @@ class RiskAssessmentStore:
         *,
         document: Dict[str, Any],
         clause_ids: List[str],
+        rag: Optional[Dict[str, Any]] = None,
         warnings: Optional[List[str]] = None,
         status: AssessmentStatus = "queued",
     ) -> str:
@@ -129,6 +134,7 @@ class RiskAssessmentStore:
             status=status,
             created_at_ts=_now_ts(),
             document=document,
+            rag=dict(rag or {}),
             clause_ids=list(clause_ids),
             total_clauses=len(clause_ids),
             warnings=list(warnings or []),
@@ -176,6 +182,15 @@ class RiskAssessmentStore:
             if rec is None:
                 return False
             rec.warnings.append(warning)
+            return True
+
+    async def set_rag(self, assessment_id: str, rag: Dict[str, Any]) -> bool:
+        """Persist the RAG / retrieval configuration used for this assessment."""
+        async with self._lock:
+            rec = self._items.get(assessment_id)
+            if rec is None:
+                return False
+            rec.rag = dict(rag or {})
             return True
 
     async def set_progress(
