@@ -1,554 +1,1237 @@
-# **MCP Document Parser Server — Setup & Integration Guide**
 
-**This README is written for your ****Python MCP server** that parses **DOCX/PDF** (tracked changes + comments) and runs a **deterministic clause-by-clause risk assessment workflow** using  **pgvector RAG + LLM structured outputs** **.**
-
-It covers:
-
-1. **How to set up the MCP server from scratch**
-2. **A drill-down of each component and tool**
-3. **What to know when integrating into another system** (OpenWebUI, AI SDK apps, etc.)
+Below are **full markdown** drafts for both documents. I made a few reasonable assumptions and marked them as **(unknown)** where your repo content wasn’t provided (e.g., exact **parse_pdf.py** behavior).
 
 ---
 
-## **1) Setup from scratch**
-
-### **1.1 Prereqs**
-
-* **Python**: 3.10+ recommended
-* **Postgres + pgvector**: required if you want RAG retrieval (policy DB)
-* **LLM endpoint** **:**
-* Local **Ollama** (OpenAI-compatible **/v1** for chat, native **/api/embed** for embeddings), or
-* Azure OpenAI (optional, used for “assessment” profile)
-
-### **1.2 Clone and install**
+# **README.md**
 
 ```
-git clone <your-repo-url> mcp-document-parser
-cd mcp-document-parser
+# MCP Document Parser + Supplier Risk Assessment
+
+A Python **MCP (Model Context Protocol)** server that:
+1) parses supplier/legal **DOCX** and **PDF** documents into structured clauses (including tracked changes + comments), and  
+2) runs a deterministic, clause-by-clause **risk assessment** using:
+- **Azure OpenAI Gov** *or* any **OpenAI-compatible** endpoint (including **Ollama** and **vLLM/NIM**)
+- **Postgres + pgvector** for policy retrieval (RAG)
+- an async **job store** with **status polling**
+- both **REST endpoints** and **MCP JSON-RPC over SSE**
+
+It integrates with **OpenWebUI** via an **OpenWebUI Pipelines** “model” that captures file uploads in `inlet()` and orchestrates calls into the MCP server.
+
+---
+
+## Why this exists
+
+Most “upload + summarize” workflows fail in enterprise settings because they:
+- don’t preserve tracked changes and review comments
+- aren’t deterministic (hard to explain/verify)
+- can’t enforce a consistent JSON schema per clause
+- don’t separate chat vs embeddings model configuration (critical for RAG correctness)
+- don’t integrate cleanly with OpenWebUI file storage + Pipelines
+
+This project solves that with:
+- robust DOCX parsing (TOC skip, headings, redlines/comments)
+- a deterministic assessment loop with structured outputs
+- a dedicated embeddings profile + embedding dimension checks
+- first-class OpenWebUI Pipelines integration
+
+---
+
+## Architecture diagram (Mermaid)
+
+```mermaid
+flowchart LR
+  U[User in OpenWebUI] -->|upload docx/pdf| OW[OpenWebUI]
+  OW -->|/chat/completions| P[Pipelines Model]
+  P -->|GET /api/v1/files/{id}/content| OW
+  P -->|POST /tools/risk_assessment/start| MCP[MCP Server (FastAPI)]
+  P -->|poll /tools/risk_assessment/status| MCP
+  P -->|POST /tools/risk_assessment/report| MCP
+
+  MCP -->|embed query| EMB[Embeddings Provider<br/>Azure / vLLM / Ollama]
+  MCP -->|vector search| PG[(Postgres + pgvector)]
+  MCP -->|chat scoring| LLM[Chat Provider<br/>Azure / vLLM / Ollama]
+```
+
+---
+
+## **Features**
+
+### **Parsing**
+
+* DOCX parsing with:
+  * TOC skipping
+  * heading/outline-level detection
+  * grouping subclauses into “one card per main clause” for UI
+  * **tracked changes (**ins/del/moveTo/moveFrom**)**
+  * comments from **comments.xml** + anchored snippets
+* PDF parsing (**tools/parse_pdf.py**) *(details depend on file; see Technical Docs)*
+
+### **Risk assessment workflow**
+
+* Deterministic clause-by-clause loop
+* Async job execution with polling
+* Dedicated embeddings profile + dimension validation
+* RAG policy retrieval from pgvector
+* Structured per-clause JSON result + markdown report rendering
+
+### **Interfaces**
+
+* REST endpoints for pipelines and non-MCP clients
+* MCP JSON-RPC over SSE (**/sse** + **/messages**) for MCP-native clients
+* /health** + **/health/llm** diagnostics**
+
+### **OpenWebUI integration**
+
+* Pipeline captures **body["files"]** in **inlet()**
+* Downloads file bytes from OpenWebUI file API
+* Calls MCP server REST endpoints
+* Streams progress updates with event emitters
+* Supports chunked final output to avoid OpenWebUI “Chunk too big”
+
+---
+
+## **Requirements**
+
+### **Runtime**
+
+* Python **3.11+**
+* Postgres + **pgvector** (required for policy retrieval)
+* One of:
+  * Azure OpenAI Gov endpoint (optional)
+  * OpenAI-compatible endpoint (Ollama, vLLM, NIM, etc.) (optional)
+
+### **Python dependencies**
+
+Installed from **requirements.txt** (exact packages depend on your file), typically includes:
+
+* fastapi**, **uvicorn
+* httpx
+* pydantic**, **pydantic-settings
+* **lxml** (DOCX parsing)
+* **psycopg** / **psycopg_pool** (pgvector retrieval)
+
+### **Docker (optional)**
+
+* Docker Desktop (macOS/Windows) or Docker Engine (Linux)
+* Docker is recommended for Postgres+pgvector and for containerizing the MCP server
+
+---
+
+## **Repo layout (high level)**
+
+```
+mcp-document-parser/
+  mcp_server/
+    server.py              # FastAPI + REST + MCP SSE JSON-RPC + /health/llm
+    config.py              # Pydantic settings + model profile system
+    schemas.py             # Pydantic models + MCP tool schemas
+    providers/llm.py       # Azure + OpenAI-compatible clients (chat + embeddings)
+    rag/pgvector.py        # pgvector retriever + filters + dimension validation
+    tools/
+      parse_docx.py        # DOCX parsing (current)
+      parse_pdf.py         # PDF parsing
+      normalize_clauses.py # boundary-based normalization + dedupe + hierarchy
+      risk_assessment.py   # tool handlers + markdown report rendering
+    workflows/risk_assessment/
+      runner.py            # deterministic assessment loop + embeddings health check
+      store.py             # async in-memory job store
+  scripts/seed_policies.py # seed policy chunks into policy_chunks
+  pipelines/supplier_risk_pipe.py # OpenWebUI Pipelines model
+```
+
+Note: you have **parse_docx2.py**, **parse_docx3.py** (variants). Current active one depends on your **tools/__init__.py** wiring (unknown). Prefer a single canonical parser file for production.
+
+---
+
+## **Quickstart (local run)**
+
+### **1) Create and activate venv**
+
+```
+cd mcp-doc-parser/mcp-document-parser
 python -m venv .venv
-source .venv/bin/activate
-pip install -U pip
+source .venv/bin/activate   # macOS/Linux
+# .venv\Scripts\Activate.ps1 # Windows PowerShell
+```
+
+### **2) Install deps**
+
+```
 pip install -r requirements.txt
 ```
 
-If you don’t have a **requirements.txt**, the core runtime requirements implied by your code are typically:
-
-* fastapi**, **uvicorn
-* pydantic**, **pydantic-settings
-* httpx
-* lxml
-* sqlalchemy**, **psycopg** (or **psycopg2**)**
-* **PyMuPDF** (for PDF parsing)
-* **pgvector** (db side; python uses SQL + embedding)
-
-### **1.3 Configure environment**
-
-Create a **.env** in the project root (or wherever your server reads it) similar to yours:
+### **3) Start Postgres + pgvector (Docker recommended)**
 
 ```
-# -----------------------
-# MCP Server
-# -----------------------
+docker run -d --name pgvector \
+  -p 5432:5432 \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=pgvector_mcp_document \
+  -v pgdata:/var/lib/postgresql/data \
+  pgvector/pgvector:pg16
+```
+
+### **4) Configure** ****
+
+### **.env**
+
+See “Configuration” below. At minimum:
+
+* POLICY_DB_URL=...
+* model profiles (Ollama or Azure)
+* **EMBEDDINGS_DIM** matching your embeddings model
+
+### **5) Run the server**
+
+```
+python -m mcp_server
+# or:
+uvicorn mcp_server.server:app --host 0.0.0.0 --port 8765
+```
+
+### **6) Smoke tests**
+
+```
+curl http://localhost:8765/health
+curl http://localhost:8765/health/llm
+```
+
+---
+
+## **Quickstart (Docker run)**
+
+### **1) Build**
+
+```
+docker build -t mcp-server:latest -f mcp_server/Dockerfile .
+```
+
+### **2) Create env file for container**
+
+Create **mcp-server.env** (docker env-file format: **KEY=VALUE** per line):
+
+```
 MCP_SERVER_HOST=0.0.0.0
 MCP_SERVER_PORT=8765
 LOG_LEVEL=INFO
 
-# -----------------------
-# Policy DB / pgvector (RAG)
-# -----------------------
-POLICY_DB_URL=postgresql+psycopg://postgres:postgres@localhost:5432/pgvector_mcp_document
+POLICY_DB_URL=postgresql+psycopg://postgres:postgres@host.docker.internal:5432/pgvector_mcp_document
 POLICY_DEFAULT_COLLECTION=default
 POLICY_TOP_K_DEFAULT=3
 
-# -----------------------
-# Model profiles
-# -----------------------
+EMBEDDINGS_MODEL_PROFILE=assessment
+EMBEDDINGS_DIM=1536
+
+AZURE_OPENAI_SSL_VERIFY=false
+MODEL_PROFILES_JSON={...one-line-json...}
 DEFAULT_CHAT_MODEL_PROFILE=chat
 DEFAULT_ASSESSMENT_MODEL_PROFILE=assessment
 ALLOW_MODEL_OVERRIDE=false
+```
 
-# -----------------------
-# Local Ollama defaults
-# -----------------------
-OLLAMA_BASE_URL=http://localhost:11434/api
-OLLAMA_OPENAI_BASE_URL=http://localhost:11434/v1
-OLLAMA_MODEL=gpt-oss:20b
+### **3) Run**
 
-# --- Embeddings selection ---
-EMBEDDINGS_MODEL_PROFILE=chat
+macOS/Windows:
 
-# --- Ollama embeddings (native API) ---
-OLLAMA_EMBEDDINGS_URL=http://localhost:11434/api/embed
-OLLAMA_EMBEDDINGS_MODEL=nomic-embed-text:latest
+```
+docker run -d --name mcp-server \
+  -p 8765:8765 \
+  --env-file ./mcp-server.env \
+  mcp-server:latest
+```
+
+Linux requires:
+
+```
+docker run -d --name mcp-server \
+  --add-host=host.docker.internal:host-gateway \
+  -p 8765:8765 \
+  --env-file ./mcp-server.env \
+  mcp-server:latest
+```
+
+### **4) Verify**
+
+```
+curl http://localhost:8765/health
+curl http://localhost:8765/health/llm
+```
+
+---
+
+## **Configuration**
+
+### **Model profiles system (Ollama vs Azure vs vLLM/NIM)**
+
+The server resolves logical model usage via **profiles**:
+
+* **chat** profile: general chat usage (OpenWebUI interactive, summaries, etc.)
+* **assessment** profile: deterministic scoring of clauses
+* optional **embeddings** profile: embeddings used for RAG retrieval
+
+Profiles can be configured two ways:
+
+#### **A) Explicit profiles via** ****
+
+#### **MODEL_PROFILES_JSON**
+
+#### ** (recommended)**
+
+Example: Azure OpenAI Gov
+
+```
+MODEL_PROFILES_JSON={"chat":{"provider":"azure_openai","azure_endpoint":"https://...","azure_api_version":"2024-02-01","azure_deployment":"chat-deploy","api_key":"...","azure_embeddings_deployment":"embed-deploy","azure_embeddings_api_version":"2024-10-21"},"assessment":{"provider":"azure_openai","azure_endpoint":"https://...","azure_api_version":"2024-02-01","azure_deployment":"chat-deploy","api_key":"...","azure_embeddings_deployment":"embed-deploy","azure_embeddings_api_version":"2024-10-21"}}
+DEFAULT_CHAT_MODEL_PROFILE=chat
+DEFAULT_ASSESSMENT_MODEL_PROFILE=assessment
+EMBEDDINGS_MODEL_PROFILE=assessment
+```
+
+Example: vLLM/NIM (OpenAI-compatible)
+
+```
+MODEL_PROFILES_JSON={"chat":{"provider":"openai_compatible","base_url":"http://vllm-host:8000/v1","api_key":"token","model":"meta/llama-3.1-8b-instruct"},"assessment":{"provider":"openai_compatible","base_url":"http://vllm-host:8000/v1","api_key":"token","model":"meta/llama-3.1-8b-instruct"},"embeddings":{"provider":"openai_compatible","base_url":"http://embed-host:8001/v1","api_key":"token","model":"BAAI/bge-base-en-v1.5"}}
+DEFAULT_CHAT_MODEL_PROFILE=chat
+DEFAULT_ASSESSMENT_MODEL_PROFILE=assessment
+EMBEDDINGS_MODEL_PROFILE=embeddings
 EMBEDDINGS_DIM=768
-
-# -----------------------
-# Azure OpenAI (optional)
-# -----------------------
-AZURE_OPENAI_ENDPOINT=
-AZURE_OPENAI_API_KEY=
-AZURE_OPENAI_API_VERSION=
-AZURE_OPENAI_DEPLOYMENT=
-AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT=
-AZURE_OPENAI_EMBEDDINGS_API_VERSION=
 ```
 
-**Important:** Keep **POLICY_TOP_K_DEFAULT** aligned with what your client and schemas use. You’ve moved toward **3** to reduce prompt bloat and output truncation risk.
+#### **B) Implicit profiles from env vars (fallback)**
 
-### **1.4 Start Postgres + pgvector (docker)**
+**If **MODEL_PROFILES_JSON** is empty, **config.py** builds:**
 
-Example:
+* **chat** from Ollama defaults
+* **assessment** from Azure vars if present, else same as chat
+* optional **embeddings** profile if Azure embeddings deployment is provided
+
+---
+
+## **Embeddings configuration + dimension check**
+
+RAG retrieval requires embeddings. The system enforces:
+
+* **EMBEDDINGS_MODEL_PROFILE** selects which profile performs embeddings
+* EMBEDDINGS_DIM** must match:**
+  * the embeddings model output dimension
+  * the pgvector column dimension in the DB
+
+The server checks embedding dimension during:
+
+* /health/llm** (probe: **embed_texts("dimension check")**)**
+* risk workflow start (fails fast if mismatched)
+
+Common dimensions:
+
+* text-embedding-ada-002**: ****1536**
+* many local embedding models: **768** (varies)
+
+---
+
+## **Postgres schema expectations (policy_chunks)**
+
+Minimum required table (default name **policy_chunks**):
 
 ```
-docker run --name pgvector_mcp \
-  -e POSTGRES_PASSWORD=postgres \
-  -p 5432:5432 \
-  -d pgvector/pgvector:pg16
+CREATE TABLE IF NOT EXISTS policy_chunks (
+  policy_id   text NOT NULL,
+  chunk_id    text NOT NULL,
+  collection  text NOT NULL DEFAULT 'default',
+  text        text NOT NULL,
+  metadata    jsonb NOT NULL DEFAULT '{}'::jsonb,
+  embedding   vector(1536) NOT NULL,
+  PRIMARY KEY (policy_id, chunk_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_policy_chunks_collection
+  ON policy_chunks (collection);
+
+CREATE INDEX IF NOT EXISTS idx_policy_chunks_embedding
+  ON policy_chunks USING ivfflat (embedding vector_cosine_ops);
 ```
 
-Then create your DB:
+Adjust the vector dimension to match **EMBEDDINGS_DIM**.
+
+Seeding: see **scripts/seed_policies.py** (usage depends on file; unknown).
+
+---
+
+## **API endpoints reference**
+
+### **Health**
+
+* GET /health** → **{"status":"healthy","version":"..."}
+* **GET /health/llm** → checks chat + embeddings connectivity + dimension match
+
+### **Parsing (REST)**
+
+* POST /tools/parse_docx
+* POST /tools/parse_pdf
+* POST /tools/normalize_clauses
+
+### **Risk workflow (REST)**
+
+* POST /tools/risk_assessment/start
+* POST /tools/risk_assessment/status
+* POST /tools/risk_assessment/get_clause_result
+* POST /tools/risk_assessment/report
+* POST /tools/risk_assessment/cancel
+* POST /tools/risk_assessment/start_upload** (multipart helper)**
+
+### **MCP (JSON-RPC over SSE)**
+
+* **GET /sse** (server-sent events)
+* POST /messages?session_id=...** (JSON-RPC messages)**
+* Supported methods:
+  * initialize
+  * tools/list
+  * tools/call
+
+---
+
+## **Example curl commands**
+
+### **/health**
 
 ```
-createdb -h localhost -p 5432 -U postgres pgvector_mcp_document
+curl http://localhost:8765/health
 ```
 
-If you have a SQL setup script, run it. At minimum you need:
-
-* a table storing policy chunks
-* a vector column matching **EMBEDDINGS_DIM**
-* an index on the vector column
-* a **collection** column if you support multiple policy sets
-
-*(If you want, I can provide a canonical **policy_chunks** schema + ingestion script in a separate response.)*
-
-### **1.5 Start Ollama (if using local)**
+### **/health/llm**
 
 ```
-ollama serve
+curl http://localhost:8765/health/llm
 ```
 
-Pull models:
+### **parse_docx**
 
 ```
-ollama pull gpt-oss:20b
-ollama pull nomic-embed-text:latest
+curl -s http://localhost:8765/tools/parse_docx \
+  -H "Content-Type: application/json" \
+  -d '{
+    "file_base64": "<BASE64>",
+    "options": {
+      "extract_tracked_changes": true,
+      "extract_comments": true,
+      "include_raw_spans": false
+    }
+  }'
 ```
 
-Verify endpoints:
-
-* **Chat (OpenAI compatible): **http://localhost:11434/v1/chat/completions
-* **Embeddings (native): **http://localhost:11434/api/embed
-
-### **1.6 Run the MCP server**
-
-Your entry point is:
+### **parse_pdf**
 
 ```
-python -m mcp_server
+curl -s http://localhost:8765/tools/parse_pdf \
+  -H "Content-Type: application/json" \
+  -d '{
+    "file_base64": "<BASE64>",
+    "options": {
+      "extract_annotations": true,
+      "include_raw_spans": false
+    }
+  }'
 ```
 
-You should see logs like:
+### **risk_assessment/start**
 
-* “Uvicorn running on http://0.0.0.0:8765”
-* “GET /sse 200 OK” when a client connects
-* “POST /messages?session_id=… 200 OK” when tools are invoked
+```
+curl -s http://localhost:8765/tools/risk_assessment/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "file_base64": "<BASE64>",
+    "filename": "doc.docx",
+    "file_type": "docx",
+    "policy_collection": "default",
+    "top_k": 3,
+    "model_profile": "assessment",
+    "include_text_with_changes": true,
+    "mode": "async"
+  }'
+```
 
----
+### **risk_assessment/status**
 
-## **2) MCP server drill-down: components and tools**
+```
+curl -s http://localhost:8765/tools/risk_assessment/status \
+  -H "Content-Type: application/json" \
+  -d '{"assessment_id":"<ID>"}'
+```
 
-### **2.1 High-level structure**
+### **risk_assessment/report (markdown)**
 
-Core responsibilities:
-
-1. **MCP host layer**
-   * Handles MCP sessions via SSE
-   * Receives JSON-RPC messages for **tools/list** and **tools/call**
-   * Returns tool results *in the JSON-RPC response body* (critical for clients)
-2. **Parsing layer**
-   * parse_docx** / **parse_docx2**: DOCX → **DocumentParseResult
-   * parse_pdf**: PDF → **DocumentParseResult
-   * **normalize_clauses**: optional transformation of parsed clauses
-3. **Workflow layer**
-   * **risk_assessment.start**: deterministic job runner
-   * status**, **report**, **get_clause_result**, **cancel
-4. **LLM + Embeddings provider layer**
-   * OpenAI-compatible chat calls to Ollama/vLLM
-   * Optional Azure OpenAI support
-   * Separate embeddings endpoint/model support (Ollama **/api/embed**)
-5. **RAG layer**
-   * pgvector search: embed query → cosine distance search → top_k citations
-6. **Store**
-   * In-memory job store for assessment runs + outputs + warnings + progress
-
----
-
-### **2.2** ****
-
-### **config.py**
-
-### ** — settings + model profiles**
-
-**What it does**
-
-* Loads env vars via Pydantic Settings
-* **Builds ** **model profiles** **:**
-  * **chat** profile (usually local Ollama, OpenAI-compatible **/v1**)
-  * **assessment** profile (Azure if configured, else falls back to **chat**)
-* **Supports ** **separate embeddings configuration** **:**
-  * embeddings profile can be **chat** or **assessment**
-  * embeddings can use native Ollama **/api/embed**
-
-**Important behaviors**
-
-* Strips whitespace from config strings (prevents invisible “bad URL” issues)
-* Validates that profiles have required fields
+```
+curl -s http://localhost:8765/tools/risk_assessment/report \
+  -H "Content-Type: application/json" \
+  -d '{"assessment_id":"<ID>","format":"markdown"}'
+```
 
 ---
 
-### **2.3** ****
+## **OpenWebUI + Pipelines integration (quick guide)**
 
-### **schemas.py**
+1. Install/configure OpenWebUI + Pipelines
+2. **Add **pipelines/supplier_risk_pipe.py** as a Pipelines model**
+3. Ensure Pipelines can reach:
 
-### ** — contracts and tool schemas**
+* **OpenWebUI: **http://host.docker.internal:3000
+* **MCP server: **http://host.docker.internal:8765
 
-**What it defines**
+Important: OpenWebUI doesn’t always forward files to the final completion call, but the Pipelines **inlet()** receives **body["files"]**. The pipeline captures file metadata in **inlet()** and stores it into:
 
-* Parse output models: **Clause**, **DocumentParseResult**, metadata, redlines/comments/changes
-* Workflow output models:
-  * **ClauseAssessment** (strict JSON validated)
-  * ClauseRiskResult** (adds **text_with_changes** for UI)**
-  * RiskAssessmentStartOutput**, **Status**, **Report**, etc.**
-* MCP tool registration list **MCP_TOOLS** (for **tools/list**)
+* body["_supplier_risk_file"]
 
-**Important behaviors**
+Then **pipe()** downloads bytes from:
 
-* Validators normalize:
-  * **risk_level** to low|medium|high
-  * **issues[].severity** to low|medium|high
-* Tool schema defaults:
-  * **top_k** defaults to 3 (lower prompt bloat)
+* GET /api/v1/files/{id}/content
+  and calls MCP endpoints.
+
+If the UI shows “Chunk too big”, the pipeline should chunk final output (this repo already includes a chunking valve **MAX_UI_CHUNK_CHARS** in the pipeline).
 
 ---
 
-### **2.4** ****
+## **Troubleshooting**
 
-### **tools/parse_docx.py**
+### **“LLM returned non-JSON response (HTML redirect)”**
 
-### ** — DOCX parsing (tracked changes + comments)**
+Symptoms:
 
-**What it does**
+* LLM returned non-JSON response ... content_type='text/html' location=...
+  Common causes:
+* wrong Azure endpoint path (redirect)
+* proxy intercepting
+* missing headers/auth
+  Fix:
+* **run **GET /health/llm
+* verify endpoint URL and deployment names
+* check request-id headers in error message
 
-* **Reads **word/document.xml** and (optionally) **word/comments.xml
-* Produces a list of **Clause** objects with:
-  * text
-  * raw_spans** (**normal/inserted/deleted/comment_ref/...**)**
-  * **redlines** (insertions/deletions)
-  * **comments** (margin comments)
-  * **changes** (structured change items + comment anchor snippets)
-* Uses block-level revision containers:
-  * handles paragraphs wrapped by **<w:ins>**, **<w:del>**, etc.
+### **“CERTIFICATE_VERIFY_FAILED”**
 
-**Clause boundary logic**
+Cause:
 
-* If document contains ARTICLE/SECTION headings:
-  * split by those headings
-  * do NOT split by numeric subheadings like 1.1
-* Else:
-  * split by numeric headings at shallowest numeric depth
+* TLS interception / missing corporate CA in trust store
+  Fix options:
+* **preferred: set **AZURE_OPENAI_CA_BUNDLE=<path-to-ca.pem>** and **AZURE_OPENAI_SSL_VERIFY=true
+* **fallback: **AZURE_OPENAI_SSL_VERIFY=false** (temporary)**
 
----
+### **“Proxy 407”**
 
-### **2.5** ****
+Cause:
 
-### **tools/parse_docx2.py**
+* outbound request forced through a proxy requiring auth
+  Fix:
+* **set **NO_PROXY=localhost,127.0.0.1,host.docker.internal
+* ensure local services aren’t routed through proxy
 
-### ** — “TOC + heading header” format parser (new)**
+### **“Embedding dimension mismatch”**
 
-**Why it exists**
+Cause:
 
-* Your new document format includes:
-  * a **TOC** at the start that must be ignored
-  * headings that appear as navigation pane items
-  * auto-numbering that may not show in **w:t**
+* **EMBEDDINGS_DIM** doesn’t match embeddings model output or DB vector column
+  Fix:
+* **set correct **EMBEDDINGS_DIM
+* **recreate **policy_chunks.embedding vector(`<dim>`)** and re-embed policies**
 
-**What it adds**
+### **“No files found in pipeline body”**
 
-* Skips TOC in multiple ways:
-  * **TOC styles (**TOC1/TOC2/...**, **TOCHeading**)**
-  * paragraphs generated by a TOC field (**fldChar** / **instrText**)
-  * literal “TABLE OF CONTENTS”
-* Prefers Word-native boundary detection:
-  * paragraph outline levels (**w:outlineLvl**)
-  * style-derived outline levels (**styles.xml**)
-* Best-effort auto-number label reconstruction:
-  * **reads **word/numbering.xml
-  * uses **w:numPr** (**numId**, **ilvl**) to build labels when the number isn’t in text
+Cause:
 
-**What stays the same**
-
-* tracked changes extraction (ins/del/move)
-* comment extraction + anchor capture
-* structured change summary creation (**ClauseChanges**)
+* OpenWebUI didn’t include files in the final request; must capture in inlet
+  Fix:
+* ensure pipeline captures in **inlet()**
+* verify OpenWebUI calls **/filter/inlet** with files populated
 
 ---
 
-### **2.6** ****
+## **Security notes**
 
-### **tools/parse_pdf.py**
-
-### ** — PDF parsing**
-
-*(You didn’t paste it in this chat, but based on your system summary)*
-
-**Expected behavior**
-
-* Uses PyMuPDF to extract page text
-* Tries to detect:
-  * clause boundaries (typically via regex heuristics)
-  * PDF annotations (comments) where possible
-* Returns **DocumentParseResult** consistent with DOCX
+* Do **not** commit API keys or **.env** files
+* Prefer CA bundles over **verify=false**
+* Consider adding RBAC and request authentication for production (unknown / not implemented)
+* The in-memory job store is not durable; restart wipes assessments
 
 ---
 
-### **2.7** ****
+## **License**
 
-### **tools/normalize_clauses.py**
+(unknown)
 
-### ** — post-processing clause list**
+```
+---
 
-**What it does**
+# TECHNICAL_DOCUMENTATION.md
 
-* **Takes a **DocumentParseResult
-* Optionally applies boundaries (e.g., from an LLM boundary detector)
-* Dedupes by normalized text hash
-* Reassigns stable clause IDs
-* Recomputes hierarchy from **level**
+```md
+# TECHNICAL_DOCUMENTATION — MCP Document Parser + Risk Assessment
+
+This document explains the internal architecture, code modules, schemas, data flow, configuration system, and OpenWebUI Pipelines integration for the MCP Document Parser project.
+
+Assumptions:
+- `tools/parse_docx.py` is the primary DOCX parser currently used by `mcp_server.tools.parse_docx` import.
+- `tools/parse_pdf.py` exists but its internal details are (unknown) unless reviewed.
+- OpenWebUI Pipelines module is `pipelines/supplier_risk_pipe.py`.
+
+Where details are unknown, they are labeled **(unknown)** along with what would confirm them.
 
 ---
 
-### **2.8** ****
+## 1) System overview
 
-### **workflows/risk_assessment/runner.py**
+The system has four major responsibilities:
 
-### ** — deterministic assessment engine**
+1) **Parse** legal/supplier documents (DOCX/PDF) into structured `Clause` objects with:
+   - clause text
+   - hierarchical metadata (label/title/level/parent)
+   - raw spans (optional)
+   - tracked changes and comments (DOCX)
 
-**Entry**
+2) **Retrieve policy context** for each clause using:
+   - embeddings (configured via model profiles)
+   - Postgres + pgvector vector similarity search
 
-* start_risk_assessment(start: RiskAssessmentStartInput)
+3) **Assess risk deterministically**:
+   - iterate clauses in a stable order
+   - prompt LLM to output a bounded JSON schema (`ClauseAssessment`)
+   - store progress and results in an async job store
+   - render final report (JSON or markdown)
 
-**Workflow**
-
-1. Parse (if needed), otherwise use provided **parse_result**
-2. Create assessment job record (store)
-3. For each clause in order:
-   * build **clause_text_full** including “Changes:” block (comments/redlines)
-   * store the full text for UI/reporting
-   * truncate clause text for prompt safety
-   * retrieve policies via pgvector RAG
-   * build bounded policy block
-   * call LLM with strict JSON rules → validate into **ClauseAssessment**
-   * store results (assessment + rich result)
-4. Compute totals + summary
-5. Mark status completed/failed
-
-**Reliability features**
-
-* Embedding dimension health check at start
-* Prompt size caps to reduce truncation
-* Retry once on JSON validation failure with smaller prompt
+4) **Expose interfaces**:
+   - REST endpoints for Pipelines and simple clients
+   - MCP JSON-RPC over SSE for MCP-native clients
+   - health endpoints including `/health/llm` diagnostics
 
 ---
 
-### **2.9** ****
+## 2) Data flow diagrams
 
-### **workflows/risk_assessment/store.py**
+### 2.1 DOCX/PDF parsing flow
 
-### ** — in-memory job store**
+```mermaid
+flowchart TD
+  A[Input: file_path or file_base64] --> B{file_type?}
+  B -->|docx| C[tools/parse_docx.py]
+  B -->|pdf| D[tools/parse_pdf.py]
+  C --> E[DocumentParseResult]
+  D --> E[DocumentParseResult]
+  E --> F[clauses: List[Clause]]
+  E --> G[warnings: List[str]]
+```
 
-**What it stores**
+### **2.2 Risk assessment flow (async job lifecycle)**
 
-* Job status + progress
-* warnings and error string
-* **results in ****original clause order**
-* back-compat and rich results:
-  * **clause_results** (ClauseAssessment)
-  * **clause_risk_results** (ClauseRiskResult)
-  * **clause_text_by_id** (to render text even if only assessment exists)
+```
+flowchart TD
+  S[POST /tools/risk_assessment/start] --> P[load_or_parse]
+  P --> J[store.create assessment_id]
+  J -->|mode=async| T[asyncio task: _run_assessment]
+  J -->|mode=sync| T
 
-**Important behavior**
+  T --> H[embeddings probe + dim check]
+  H -->|ok| L[for each clause in deterministic order]
+  L --> R[pgvector retrieval (search_policies)]
+  R --> M[LLM chat_object -> ClauseAssessment JSON]
+  M --> W[store.put_clause_result / put_clause_risk_result]
+  W --> L
 
-* **report_output()** returns results in the **planned clause order**
-* Prefers rich results where available
-* Wraps assessments with stored text when needed
+  L -->|done| SUM[LLM executive summary]
+  SUM --> REP[store.set_report]
+  REP --> DONE[store.set_status completed]
+```
 
----
+### **2.3 OpenWebUI → Pipelines → MCP integration flow**
 
-### **2.10** ****
-
-### **tools/risk_assessment.py**
-
-### ** — MCP tool handlers**
-
-Implements MCP-facing methods:
-
-* risk_assessment.start
-* risk_assessment.status
-* risk_assessment.get_clause_result
-* risk_assessment.report** (json or markdown)**
-* risk_assessment.cancel
-
-Also contains markdown rendering that:
-
-* avoids duplicate clause headers
-* supports either ClauseAssessment or ClauseRiskResult payloads
-
----
-
-## **3) Integration notes: plugging into OpenWebUI or another AI SDK system**
-
-### **3.1 What an external system needs to know**
-
-This server provides an **MCP tool interface**. Any client that can:
-
-* connect to **GET /sse**
-* **send JSON-RPC messages to **POST /messages?session_id=...
-
-…can call tools, list tools, and receive structured outputs.
-
-Most “agent frameworks” want:
-
-* tool listing
-* tool invocation
-* JSON results
-
-Your key fix (already done) was ensuring **/messages** returns the **actual JSON-RPC response** including tool results — not just **{status:"ok"}**.
+```
+flowchart LR
+  U[User Uploads File] --> OW[OpenWebUI]
+  OW --> INLET[Pipelines inlet() receives body.files]
+  INLET -->|capture| MEM[body._supplier_risk_file]
+  OW --> PIPE[Pipelines pipe()]
+  PIPE -->|GET file bytes| OWF[OpenWebUI /api/v1/files/{id}/content]
+  PIPE -->|POST start| MCP[ /tools/risk_assessment/start ]
+  PIPE -->|poll status| MCP2[ /tools/risk_assessment/status ]
+  PIPE -->|fetch report| MCP3[ /tools/risk_assessment/report ]
+  PIPE -->|stream progress + final report| OW
+```
 
 ---
 
-### **3.2 Common integration patterns**
+## **3) Module-by-module walkthrough**
 
-#### **Pattern A: AI SDK / Next.js backend (your current approach)**
+### **3.1** ****
 
-* The backend exposes an **/api/chat** route that:
-  * passes tools to the model
-  * forwards tool calls to MCP server
-  * returns tool results to UI
+### **mcp_server/server.py**
 
-Best practices:
+Responsibilities:
 
-* Use **upload-only** flow to store base64 and filename
-* Let risk assessment parse internally if parsing wasn’t done yet
-* **Always poll **risk_assessment.status** and snapshot **risk_assessment.report** for UI rendering**
+* Creates a FastAPI application with CORS enabled.
+* Exposes:
+  * GET /health
+  * **GET /health/llm** (diagnostic chat + embeddings probe)
+  * REST tool endpoints under **/tools/...**
+  * MCP protocol endpoints:
+    * GET /sse
+    * POST /messages?session_id=...
 
-#### **Pattern B: OpenWebUI tool server**
+Key components:
 
-OpenWebUI can integrate tools and MCP servers via “tool calling” plumbing. Practical notes:
+#### **Windows asyncio compatibility**
 
-* You typically need a **bridge** that converts OpenWebUI tool invocations into MCP JSON-RPC calls.
-* If OpenWebUI expects “OpenAI tool schema,” you map MCP’s **tools/list** output into an OpenAI-style tool list.
-* Keep tool output compact:
-  * your report objects can get large
-  * prefer returning a report summary + clause_items
-  * fetch full clause details on-demand via **get_clause_result**
+A Windows-only event-loop policy override is applied to avoid psycopg async incompatibility with ProactorEventLoop:
 
----
+```
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+```
 
-### **3.3 Key behaviors to preserve when integrating elsewhere**
+This prevents warnings like:
 
-#### **A) Deterministic output + job semantics**
+* “Psycopg cannot use the ProactorEventLoop … in async mode”
 
-Your workflow is intentionally deterministic:
+#### **REST endpoints**
 
-* ordered clause processing
-* consistent output model validation
-* store-driven status/progress
+**/tools/*** endpoints validate payloads using Pydantic schemas in **schemas.py** and dispatch to corresponding tool functions (parse/normalize/risk).
 
-When integrating:
+#### **MCP over SSE**
 
-* treat **risk_assessment.start** as “enqueue job”
-* UI/agent should poll status and fetch report snapshots
-* do not assume the report is complete until status is **completed**
+Implements MCP JSON-RPC:
 
-#### **B) Expect and handle warnings**
+* **tools/list** returns **MCP_TOOLS** schema list
+* **tools/call** validates tool name + arguments and calls **_call_tool**
 
-Missing clause outputs are almost always explained by:
+Notes:
 
-* LLM output invalid JSON → clause skipped, warning recorded
-* policy DB retrieval error → warning recorded
+* The server supports both REST and MCP transport and reuses the same underlying tool logic.
 
-Integrations should expose **warnings[]** somewhere (even if hidden behind a “debug” panel).
+#### **/health/llm**
 
-#### **C) Token/size management**
+This endpoint:
 
-You already learned the big one:
+* **selects **assessment_profile** and **embeddings_profile
+* probes chat with a simple ping prompt
+* **probes embeddings with **embed_texts("dimension check")
+* checks embedding vector length matches **Settings.embeddings_dim**
 
-* **max output tokens matters** (JSON truncation = validation failure = dropped clauses)
+This endpoint is the fastest way to debug:
 
-Integration tips:
-
-* keep prompt bounded (you do)
-* keep tool results bounded (especially returning clause lists + full text)
-* stream report markdown only when requested
+* TLS errors
+* proxy errors
+* wrong deployment names
+* embedding dimension mismatches
 
 ---
 
-### **3.4 Deployment + reliability notes**
+### **3.2** ****
 
-#### **In-memory stores**
+### **mcp_server/schemas.py**
 
-Two important ephemeral stores exist:
+Defines all data models:
 
-* MCP server store for assessments/results
-* (If applicable) client-side store for uploads/parse results
+* **parsing outputs: **DocumentParseResult**, **Clause**, **ClauseChanges**, **Redlines**, **Comment
+* **normalization outputs: **ClauseListNormalized**, **NormalizedClause
+* **risk workflow inputs/outputs: **RiskAssessmentStartInput**, **RiskAssessmentStatusOutput**, **RiskAssessmentReportOutput**, etc.**
+* scoring models:
+  * **ClauseAssessment** (strict JSON output schema)
+  * **ClauseRiskResult** (wraps the assessed clause text + **ClauseAssessment**)
 
-If you deploy in containers / scale out:
+Important patterns:
 
-* assessments will vanish on restart
-* multiple replicas will not share job state
+* Validators normalize enums like **risk_level** and **issues[].severity** to strict values: **low|medium|high**.
+* RiskAssessmentStartInput** enforces:**
+  * **either **file_path/file_base64** OR **parse_result
+  * requires **file_type** if base64 is provided without filename/path
+* **stable_clause_id(index, text)** generates stable IDs per clause content.
 
-For production:
+Tool registration:
 
-* move store to Redis/Postgres
-* store the parse result and assessment outputs durably
-* store raw uploads in blob storage (S3/Azure Blob)
-
-#### **Concurrency**
-
-Your runner currently processes clauses sequentially (deterministic). The schema includes **concurrency**, but implementation is sequential.
-
-If you add concurrency later:
-
-* ensure store updates remain ordered
-* cap concurrency to avoid saturating LLM endpoint
-* preserve deterministic ordering in the final report (store already does this)
+* **MCP_TOOLS** defines the MCP tool catalog returned by **tools/list**.
 
 ---
 
-### **3.5 Security notes (especially for enterprise)**
+### **3.3** ****
 
-* Treat **file_base64** as sensitive: contracts often contain regulated data
-* Avoid logging file content or clause text in INFO logs
-* Use TLS if crossing networks
-* Restrict MCP server access to trusted clients (network ACL, auth token, mTLS, etc.)
+### **mcp_server/tools/parse_docx.py**
+
+### ** (and variants)**
+
+DOCX parsing capabilities (as implemented in your provided parser variant):
+
+* Reads **.docx** zip parts:
+  * word/document.xml
+  * **word/styles.xml** (outline levels)
+  * **word/numbering.xml** (auto numbering best-effort)
+  * **word/comments.xml** (comments + metadata)
+* Skips Table of Contents via:
+  * TOC styles (**TOC1**, **TOCHeading**, etc.)
+  * TOC field markers (**fldChar**, **instrText**)
+  * literal “Table of Contents” paragraph
+* Heading detection:
+  * primary heuristic: choose *shallowest outline level* as boundary
+  * fallback: ARTICLE/SECTION/numeric patterns
+  * avoids splitting on list-numbered paragraphs (**w:numPr**)
+* Tracked changes extraction:
+  * w:ins**, **w:del**, **w:moveTo**, **w:moveFrom
+* Comment extraction:
+  * parses comment metadata
+  * anchors comment text to relevant paragraph spans
+* Produces:
+  * **Clause.text** containing boundary + merged subclauses
+  * Clause.redlines** and **Clause.changes** structured fields**
+
+Design rationale:
+
+* **TOC skipping** prevents false clause boundaries.
+* “one card per main clause” UX: boundaries only at top-level headings; subclauses merged.
+
+Variants:
+
+* **parse_docx2.py**, **parse_docx3.py** exist (unknown purpose). For production, prefer a single canonical parser and remove/archvive older variants or gate them behind flags.
 
 ---
 
-## **Quick “operator” checklist**
+### **3.4** ****
 
-* **✅ **python -m mcp_server** runs**
-* ✅ **GET /sse** returns 200
-* ✅ client can call **tools/list**
-* ✅ DOCX parsing returns clauses **excluding TOC**
-* **✅ **risk_assessment.start(mode=async)** returns assessment_id**
-* ✅ **risk_assessment.status** progresses to completed
-* ✅ **risk_assessment.report(format=json)** returns ordered clause_results + totals + summary
-* ✅ warnings are surfaced somewhere in the client
+### **mcp_server/tools/parse_pdf.py**
+
+### ** (present, details unknown)**
+
+Expected responsibilities:
+
+* load PDF bytes
+* extract text and (optionally) annotations (comments/strikethrough)
+* **produce a **DocumentParseResult** with **Clause** list**
+  To confirm: inspect **parse_pdf.py** parsing strategy (page chunking, heading detection, annotation extraction).
 
 ---
 
-If you want, I can also produce:
+### **3.5** ****
 
-* a **minimal ****requirements.txt** matched to your code imports
-* a **pgvector schema + ingestion script** (policies -> chunking -> embeddings -> insert)
-* **a ****“How to add parse_docx2 as an MCP tool + route it”** checklist (server dispatch + MCP_TOOLS entry)
+### **mcp_server/tools/normalize_clauses.py**
+
+Takes:
+
+* NormalizeClausesInput(parse_result, boundaries?)
+
+If **boundaries** provided:
+
+* builds a global text string
+* maps boundary spans back to original clause ranges
+* merges metadata from contributing clauses
+* **sets **was_merged** / **was_split** flags**
+
+Always:
+
+* deduplicates clauses by normalized text hash
+* reassigns stable clause IDs
+* fixes hierarchy based on **level**
+
+Design rationale:
+
+* Supports future LLM-assisted boundary detection while keeping normalization deterministic.
+* Deduping prevents duplicate UI cards and repeated assessments.
+
+---
+
+### **3.6** ****
+
+### **mcp_server/workflows/risk_assessment/runner.py**
+
+This is the core deterministic workflow.
+
+Key steps:
+
+1. **Load or parse**
+
+* If **start.parse_result** provided, trust it.
+* Else infer file type and call:
+  * parse_docx** or **parse_pdf
+
+2. **Create assessment record**
+
+* store.create(document, clause_ids, warnings, status)
+
+3. **Resolve model profiles**
+
+* assessment profile:
+  * **from **start.model_profile** with fallback to **Settings.default_assessment_profile
+* embeddings profile:
+  * from **Settings.embeddings_model_profile** with fallback to chat/assessment
+
+Design rationale:
+
+* Embeddings profile must be decoupled from chat/assessment to prevent accidental embedding calls to wrong endpoint.
+
+4. **Embeddings health check**
+
+* **one-time probe **embed_texts("dimension check")
+* validate returned vector length == **Settings.embeddings_dim**
+* fail fast if mismatch
+
+5. **Deterministic clause iteration**
+
+* iterate **clause_order** in stable parsed order
+* for each clause:
+  * format clause text (optional changes/comments)
+  * retrieve policy citations with **search_policies()**
+  * **call LLM with **chat_object(... schema=ClauseAssessment ...)
+  * store:
+    * ClauseAssessment (back-compat)
+    * ClauseRiskResult (rich, includes clause text)
+
+6. **Executive summary**
+
+* Builds a compact summary seed from top medium/high risk clauses
+* Calls **chat_text()** for the final summary
+* Falls back to deterministic summary if LLM fails
+
+7. **Guard: fail if no results**
+
+* If all clause assessments fail and **results** is empty, the workflow raises:
+  * "All clause assessments failed (no clause results produced) ..."
+    This prevents misleading “completed” status.
+
+Observability:
+
+* Warnings accumulated in store explain:
+  * retrieval failures
+  * JSON/schema validation issues
+  * truncation events
+
+---
+
+### **3.7** ****
+
+### **mcp_server/workflows/risk_assessment/store.py**
+
+In-memory async job store (**RiskAssessmentStore**):
+
+* create()** returns **assessment_id
+* set_status()**, **set_progress()**, **add_warning()
+* stores results in two shapes:
+  * clause_results**: **clause_id -> ClauseAssessment** (legacy)**
+  * clause_risk_results**: **clause_id -> ClauseRiskResult** (preferred)**
+  * **clause_text_by_id**: exact assessed clause text (optional)
+
+Report assembly:
+
+* **report_output()** preserves clause ordering based on plan (**clause_ids**)
+* prefers rich results, wraps assessments with text if available
+
+Durability:
+
+* In-memory only. Restart wipes all job state.
+* Scaling to multiple workers requires an external store (Redis/Postgres) (not implemented).
+
+---
+
+### **3.8** ****
+
+### **mcp_server/tools/risk_assessment.py**
+
+Tool wrapper layer for the workflow:
+
+* start/status/report/get_clause_result/cancel
+* **_render_report_markdown()** builds the final markdown report:
+  * summary + totals
+  * per-clause sections including clause text, risk level, issues, citations, redlines
+
+Back-compat:
+
+* report rendering can handle:
+  * ClauseAssessment only
+  * ClauseRiskResult with embedded **assessment**
+
+---
+
+### **3.9** ****
+
+### **mcp_server/rag/pgvector.py**
+
+Implements vector search against Postgres+pgvector.
+
+Highlights:
+
+* accepts an **embedder** function (sync or async)
+* normalizes embeddings to **list[float]**
+* validates embedding length matches **Settings.embeddings_dim**
+* constructs safe SQL:
+  * validates identifiers with **_safe_ident**
+* cosine distance search via **<=>**
+  * score computed as **1 - distance**
+* supports filters:
+  * policy_id
+  * **metadata** key equality
+  * other keys treated as metadata equality
+* **uses **psycopg_pool.AsyncConnectionPool** if installed, else uses **psycopg.AsyncConnection
+
+Design rationale:
+
+* dimension validation catches config drift early
+* conservative filter support reduces SQL injection risk
+* embedder passed in keeps retrieval decoupled from LLM client internals
+
+---
+
+### **3.10** ****
+
+### **mcp_server/providers/llm.py**
+
+Unified LLM client system driven by model profiles:
+
+* Supports:
+  * **openai_compatible** (Ollama, vLLM, NIM, gateways)
+  * **azure_openai** (Azure Gov endpoints)
+
+Key features:
+
+* profile-driven URL construction:
+  * **chat: **/chat/completions
+  * embeddings: **/embeddings** or explicit **embeddings_url** (Ollama native **/api/embed**)
+* retry logic for transient status codes (429, 5xx)
+* rich error messages:
+  * includes request/correlation IDs when present
+  * shows content-type and redirect location for non-JSON responses
+
+TLS / CA behavior:
+
+* Azure TLS options come from Pydantic **Settings** (important: **.env** loaded by pydantic does not always populate **os.environ**)
+  * AZURE_OPENAI_SSL_VERIFY
+  * AZURE_OPENAI_CA_BUNDLE
+
+JSON extraction:
+
+* **chat_object()** forces JSON mode where supported and validates output schema.
+* **_json_extract()** was added to handle:
+  * fenced JSON
+  * minor leading/trailing text while extracting first balanced object
+
+Design rationale:
+
+* strict schema validation prevents downstream ambiguity
+* retries + request ids improve enterprise debugging
+* separate embeddings deployment avoids “embeddings accidentally hit chat model”
+
+---
+
+## **4) Environment variables reference**
+
+Grouped by concern. Defaults come from **config.py**. If an env var is “required,” it means required for that feature.
+
+### **4.1 Server**
+
+* MCP_SERVER_HOST** (default **0.0.0.0**)**
+* MCP_SERVER_PORT** (default **8765**)**
+* LOG_LEVEL** (default **INFO**)**
+
+### **4.2 Policy DB / RAG**
+
+* **POLICY_DB_URL** (required for RAG; default points to localhost)
+* POLICY_DEFAULT_COLLECTION** (default **default**)**
+* POLICY_TOP_K_DEFAULT** (default **3**)**
+
+### **4.3 Model profiles (recommended)**
+
+* **MODEL_PROFILES_JSON** (recommended for deterministic behavior)
+* DEFAULT_CHAT_MODEL_PROFILE** (default **chat**)**
+* DEFAULT_ASSESSMENT_MODEL_PROFILE** (default **assessment**)**
+* ALLOW_MODEL_OVERRIDE** (default **false**)**
+
+### **4.4 Ollama (implicit profiles)**
+
+* OLLAMA_BASE_URL** (default **http://localhost:11434/api**)**
+* OLLAMA_OPENAI_BASE_URL** (optional)**
+* OLLAMA_MODEL** (default **gpt-oss:20b**)**
+* OLLAMA_EMBEDDINGS_URL** (default **http://localhost:11434/api/embed**)**
+* OLLAMA_EMBEDDINGS_MODEL** (default **nomic-embed-text:latest**)**
+
+### **4.5 Azure OpenAI**
+
+* AZURE_OPENAI_ENDPOINT
+* AZURE_OPENAI_API_KEY
+* AZURE_OPENAI_API_VERSION
+* AZURE_OPENAI_DEPLOYMENT
+* AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT** (recommended)**
+* **AZURE_OPENAI_EMBEDDINGS_API_VERSION** (optional; defaults to api version)
+
+### **4.6 Embeddings selection**
+
+* EMBEDDINGS_MODEL_PROFILE
+  * selects which profile is used for embeddings in RAG and dimension checks
+* EMBEDDINGS_DIM
+  * must match model output dimension and DB **vector(dim)** column
+
+### **4.7 TLS / CA**
+
+* AZURE_OPENAI_SSL_VERIFY** (default **true**)**
+* **AZURE_OPENAI_CA_BUNDLE** (optional; preferred over verify=false)
+
+### **4.8 Proxy**
+
+Because **httpx** uses **trust_env=True**, it respects standard proxy env vars:
+
+* HTTPS_PROXY
+* HTTP_PROXY
+* NO_PROXY
+
+Typical enterprise config:
+
+* include local addresses in NO_PROXY:
+  * NO_PROXY=localhost,127.0.0.1,host.docker.internal
+
+---
+
+## **5) Typical configurations**
+
+### **5.1 Local dev: Ollama + local pgvector**
+
+* Run Postgres+pgvector locally (docker)
+* Run Ollama locally
+* Use implicit profiles or explicit JSON for clarity
+* Set **EMBEDDINGS_DIM** to match your embedding model (commonly 768)
+
+### **5.2 Enterprise: Azure Gov + CA bundle + pgvector**
+
+* Use **MODEL_PROFILES_JSON** with azure profiles
+* Prefer CA bundle:
+  * AZURE_OPENAI_CA_BUNDLE=/path/to/corp-ca.pem
+  * AZURE_OPENAI_SSL_VERIFY=true
+* Ensure embeddings deployment is set and dimension is correct (often 1536)
+
+### **5.3 Docker networking: localhost vs host.docker.internal**
+
+* Inside a container:
+  * **localhost** refers to the container itself
+* If Postgres runs on host and MCP runs in container:
+  * **use **host.docker.internal:5432** (macOS/Windows)**
+  * **on Linux, add **--add-host=host.docker.internal:host-gateway
+* If everything is in one compose network:
+  * prefer service discovery (**postgres:5432**) rather than host bridging
+
+---
+
+## **6) Model profiles: resolution and behavior**
+
+### **6.1 Profile names**
+
+Common profiles:
+
+* chat
+* assessment
+* **embeddings** (optional)
+
+### **6.2 Resolution rules (simplified)**
+
+* **DEFAULT_CHAT_MODEL_PROFILE** selects the default “chat” logical profile
+* **DEFAULT_ASSESSMENT_MODEL_PROFILE** selects the default “assessment” logical profile
+* **EMBEDDINGS_MODEL_PROFILE** selects which profile is used for embeddings
+
+In the workflow:
+
+* **assessment profile: **start.model_profile** → fallback **DEFAULT_ASSESSMENT_MODEL_PROFILE
+* **embeddings profile: **EMBEDDINGS_MODEL_PROFILE** → fallback to **DEFAULT_CHAT_MODEL_PROFILE** or assessment**
+
+### **6.3 MODEL_PROFILES_JSON overrides implicit profiles**
+
+**If **MODEL_PROFILES_JSON** is present:**
+
+* it is parsed and validated
+* it becomes the source of truth for all profile configuration
+* implicit Ollama/Azure fallback is skipped
+
+Design rationale:
+
+* explicit profiles remove ambiguity and reduce “it worked yesterday” drift.
+
+---
+
+## **7) Error handling and observability**
+
+### **7.1 Request ID headers**
+
+**providers/llm.py** extracts common request ids/correlation ids:
+
+* x-ms-request-id
+* x-request-id
+* apim-request-id
+* x-correlation-id
+* traceparent
+
+These are included in raised **LLMError** messages to help track issues in enterprise gateways.
+
+### **7.2 Where errors surface**
+
+* /health/llm** returns structured **{chat:{ok}, embeddings:{ok}}** status**
+* risk workflow:
+  * appends warnings for clause-level failures
+  * fails fast for embedding dimension mismatch
+  * fails the entire job if no clause results are produced
+
+### **7.3 Debug strategy**
+
+Recommended sequence:
+
+1. GET /health
+2. GET /health/llm
+3. Run parse-only endpoint on a document
+4. Run assessment with **mode=sync** for simplest debugging
+5. Check **warnings[]** in **status** output
+
+---
+
+## **8) OpenWebUI Pipelines integration details**
+
+The pipeline’s key design decision:
+
+* file uploads appear in **body["files"]** during **inlet()**, but may be missing later.
+* pipeline stores chosen file metadata into:
+  * body["_supplier_risk_file"]
+
+Then:
+
+* downloads bytes from OpenWebUI:
+  * GET /api/v1/files/{id}/content
+* starts risk assessment:
+  * POST /tools/risk_assessment/start
+* polls status:
+  * POST /tools/risk_assessment/status
+* fetches report:
+  * POST /tools/risk_assessment/report
+
+UI streaming:
+
+* OpenWebUI can show “Chunk too big” if final report is streamed as one huge chunk.
+* pipeline includes chunking (**MAX_UI_CHUNK_CHARS**) to stream final report in smaller pieces.
+
+---
+
+## **9) “Why this design” rationale**
+
+### **Deterministic workflow**
+
+* Clause order is stable and predictable.
+* Prompts constrain output schema and size.
+* Enables reproducibility and auditability (critical for contract risk workflows).
+
+### **Separate embeddings profile**
+
+* Prevents accidental calls to chat endpoints for embeddings.
+* Allows using different providers for:
+  * chat reasoning (Azure/vLLM)
+  * embeddings (Azure/local embedding model)
+* Embedding dimension checks fail fast and prevent silent RAG corruption.
+
+### **TOC skipping and heading-based clause boundaries**
+
+* TOCs create false positives for clause boundaries.
+* Using shallowest outline heading level matches “main clause” UX.
+* Avoid splitting on list numbering keeps subclauses bundled for UI.
+
+---
+
+## **10) What would improve production readiness (not implemented)**
+
+* Persistent job store (Redis/Postgres)
+* Authn/authz for REST endpoints
+* Rate limiting / quotas
+* Structured logging correlation IDs across components
+* Storage of generated reports as downloadable files in OpenWebUI

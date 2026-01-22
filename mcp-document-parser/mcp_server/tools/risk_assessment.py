@@ -19,6 +19,7 @@ from ..schemas import (
 )
 from ..workflows.risk_assessment.store import get_store
 from ..workflows.risk_assessment.runner import start_risk_assessment
+from ..config import get_settings
 
 
 logger = logging.getLogger(__name__)
@@ -222,14 +223,35 @@ async def risk_assessment_start(input_data: RiskAssessmentStartInput) -> RiskAss
             )
 
     logger.info(
-        "risk_assessment.start called (mode=%s, model_profile=%s, top_k=%s, collection=%s)",
+        "risk_assessment.start called (mode=%s, model_profile=%s, top_k=%s, collection=%s, termset_id=%s)",
         getattr(input_data, "mode", None),
         getattr(input_data, "model_profile", None),
         getattr(input_data, "top_k", None),
         getattr(input_data, "policy_collection", None),
+        getattr(input_data, "termset_id", None),
     )
 
     out = await start_risk_assessment(input_data)
+
+    # Persist RAG / retrieval configuration snapshot for auditability/debugging.
+    # This is safe even if the runner also sets it; store.set_rag will just overwrite.
+    try:
+        settings = get_settings()
+        rag = {
+            "policy_collection": getattr(input_data, "policy_collection", None),
+            "termset_id": getattr(input_data, "termset_id", None),
+            "filters": getattr(input_data, "filters", None) or {},
+            "top_k": getattr(input_data, "top_k", None),
+            "min_score": getattr(input_data, "min_score", None),
+            # Optional diagnostics
+            "embeddings_dim": getattr(settings, "embeddings_dim", None),
+            "embeddings_model_profile": getattr(settings, "embeddings_model_profile", None),
+        }
+        store = get_store()
+        await store.set_rag(out.assessment_id, rag)
+    except Exception as e:
+        logger.warning("Failed to persist RAG config for assessment_id=%s: %s", getattr(out, "assessment_id", None), e)
+
     logger.info(
         "risk_assessment.start returning (assessment_id=%s, status=%s, clause_count=%s)",
         out.assessment_id,

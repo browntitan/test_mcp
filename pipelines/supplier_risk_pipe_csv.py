@@ -1,6 +1,6 @@
 """
 title: Supplier Risk Assessment (MCP)
-author: Shiv + ChatGPT
+author: Shiv Balodi
 version: 0.2.0
 requirements: requests,pydantic
 """
@@ -55,7 +55,7 @@ class Pipeline:
         DEBUG: bool = Field(default=True)
 
     def __init__(self):
-        self.name = "Supplier Risk Assessment (MCP)"
+        self.name = "Supplier Risk Assessment (MCP) /w .csv export"
         # load valves from env if present
         vals = {}
         for k in self.Valves.model_fields.keys():
