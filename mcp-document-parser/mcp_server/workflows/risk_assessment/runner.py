@@ -399,7 +399,20 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
             embs = await embed_llm.embed_texts(q)
             if not embs or not embs[0]:
                 raise LLMError("Embeddings endpoint returned no vectors")
-            return embs[0]
+            vec = embs[0]
+            # Debug: confirm embed length matches settings.embeddings_dim
+            expected_dim2 = getattr(settings, "embeddings_dim", None)
+            try:
+                exp_i = int(expected_dim2) if expected_dim2 is not None else None
+            except Exception:
+                exp_i = None
+            logger.debug(
+                "RAG: embed_query vec_len=%s expected_dim=%s (embeddings_profile=%s)",
+                len(vec),
+                exp_i,
+                embeddings_profile,
+            )
+            return vec
 
         include_changes = bool(start.include_text_with_changes)
 
@@ -445,6 +458,17 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
             # Retrieve policy context via pgvector.
             # We deterministically narrow guidance by clause_number and (optionally) termset.
             citations: List[PolicyCitation] = []
+            # Debug: start RAG retrieval for this clause
+            logger.info(
+                "RAG: start clause_id=%s label=%s title=%s collection=%s top_k=%s min_score=%s start_filters=%s",
+                cid,
+                getattr(clause, "label", None),
+                getattr(clause, "title", None),
+                start.policy_collection,
+                start.top_k,
+                start.min_score,
+                (start.filters or {}),
+            )
             try:
                 base_filters: Dict[str, Any] = dict(start.filters or {})
 
@@ -457,6 +481,13 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                 if termset_id:
                     base_filters["termset"] = termset_id
 
+                logger.info(
+                    "RAG: primary query clause_id=%s clause_number=%s termset_id=%s filters=%s",
+                    cid,
+                    clause_number,
+                    termset_id,
+                    base_filters,
+                )
                 citations = await search_policies(
                     clause_text,
                     collection=start.policy_collection,
@@ -465,11 +496,35 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                     filters=base_filters,
                     embedder=embed_query,
                 )
+                logger.info(
+                    "RAG: primary results clause_id=%s count=%s top=%s",
+                    cid,
+                    len(citations),
+                    (
+                        {
+                            "policy_id": citations[0].policy_id,
+                            "chunk_id": citations[0].chunk_id,
+                            "score": citations[0].score,
+                        }
+                        if citations
+                        else None
+                    ),
+                )
+                logger.debug(
+                    "RAG: primary ids clause_id=%s ids=%s",
+                    cid,
+                    [(c.policy_id, c.chunk_id) for c in (citations or [])[:5]],
+                )
 
                 # Fallback 1: If a termset was provided but no citations matched, retry without termset.
                 if (not citations) and termset_id and ("termset" in base_filters):
                     fallback_filters = dict(base_filters)
                     fallback_filters.pop("termset", None)
+                    logger.info(
+                        "RAG: fallback1 (drop termset) clause_id=%s filters=%s",
+                        cid,
+                        fallback_filters,
+                    )
                     citations = await search_policies(
                         clause_text,
                         collection=start.policy_collection,
@@ -477,6 +532,20 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                         min_score=start.min_score,
                         filters=fallback_filters,
                         embedder=embed_query,
+                    )
+                    logger.info(
+                        "RAG: fallback1 results clause_id=%s count=%s top=%s",
+                        cid,
+                        len(citations),
+                        (
+                            {
+                                "policy_id": citations[0].policy_id,
+                                "chunk_id": citations[0].chunk_id,
+                                "score": citations[0].score,
+                            }
+                            if citations
+                            else None
+                        ),
                     )
                     if citations:
                         await store.add_warning(
@@ -490,6 +559,11 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                     # Keep termset if provided (it can still narrow to global guidance).
                     if termset_id:
                         fallback_filters2["termset"] = termset_id
+                    logger.info(
+                        "RAG: fallback2 (drop clause_number) clause_id=%s filters=%s",
+                        cid,
+                        fallback_filters2,
+                    )
                     citations = await search_policies(
                         clause_text,
                         collection=start.policy_collection,
@@ -498,6 +572,20 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                         filters=fallback_filters2,
                         embedder=embed_query,
                     )
+                    logger.info(
+                        "RAG: fallback2 results clause_id=%s count=%s top=%s",
+                        cid,
+                        len(citations),
+                        (
+                            {
+                                "policy_id": citations[0].policy_id,
+                                "chunk_id": citations[0].chunk_id,
+                                "score": citations[0].score,
+                            }
+                            if citations
+                            else None
+                        ),
+                    )
                     if citations:
                         await store.add_warning(
                             assessment_id,
@@ -505,6 +593,11 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                         )
 
             except Exception as e:
+                logger.exception(
+                    "RAG: retrieval exception clause_id=%s collection=%s",
+                    cid,
+                    start.policy_collection,
+                )
                 await store.add_warning(assessment_id, f"Policy retrieval failed for clause_id={cid}: {e}")
                 citations = []
 
@@ -585,6 +678,25 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                 await store.add_warning(assessment_id, f"Clause assessment failed for clause_id={cid}: {last_err}")
                 continue
 
+            logger.info(
+                "LLM: clause_id=%s risk_level=%s risk_score=%s citations_returned=%s citations_retrieved=%s",
+                cid,
+                assessment.risk_level,
+                assessment.risk_score,
+                len(assessment.citations or []),
+                len(citations or []),
+            )
+            logger.debug(
+                "LLM: clause_id=%s citation_ids_returned=%s",
+                cid,
+                [(c.policy_id, c.chunk_id) for c in (assessment.citations or [])[:5]],
+            )
+            logger.debug(
+                "RAG: clause_id=%s citation_ids_retrieved=%s",
+                cid,
+                [(c.policy_id, c.chunk_id) for c in (citations or [])[:5]],
+            )
+
             # Force stable identity fields
             if assessment.clause_id != cid:
                 assessment = assessment.model_copy(update={"clause_id": cid})
@@ -604,6 +716,12 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                 assessment = assessment.model_copy(update={"citations": bounded_cits})
 
             # Backward-compatible storage (existing clients): ClauseAssessment only
+            logger.info(
+                "STORE: put_clause_result assessment_id=%s clause_id=%s citations_stored=%s",
+                assessment_id,
+                cid,
+                len(assessment.citations or []),
+            )
             await store.put_clause_result(assessment_id, assessment)
 
             # New richer storage (new clients): include the assessed clause text + structured assessment
