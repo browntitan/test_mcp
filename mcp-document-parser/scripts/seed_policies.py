@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -133,12 +134,72 @@ def discover_files(input_dir: Path) -> List[Path]:
     return out
 
 
+
+def _fix_mojibake_cp1252_to_utf8(s: str) -> str:
+    """Fix common mojibake where UTF-8 bytes were mis-decoded as cp1252.
+
+    Examples: â€™ -> ’, â€œ -> “, â€ -> (part of quotes/dashes).
+    """
+    if not s:
+        return s
+    # Heuristic: only attempt if we see common mojibake markers.
+    if "â" not in s and "Ã" not in s:
+        return s
+    try:
+        repaired = s.encode("cp1252", errors="ignore").decode("utf-8", errors="ignore")
+    except Exception:
+        return s
+    # Accept the repair if it reduces mojibake tokens.
+    before = s.count("â") + s.count("Ã")
+    after = repaired.count("â") + repaired.count("Ã")
+    return repaired if after < before else s
+
+
+def _normalize_text(s: str) -> str:
+    if not s:
+        return ""
+    # Remove BOM and zero-width chars that can break regex/header detection
+    s = s.replace("\ufeff", "")
+    s = s.replace("\u200b", "").replace("\u200e", "").replace("\u200f", "")
+    # Normalize newlines
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # Attempt mojibake repair
+    s = _fix_mojibake_cp1252_to_utf8(s)
+    return s
+
+
 def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8", errors="ignore")
+    """Read text files robustly across mixed encodings, then normalize/repair."""
+    raw = path.read_bytes()
+    # Try UTF-8 first; if it fails, fall back to cp1252.
+    try:
+        s = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        s = raw.decode("cp1252", errors="ignore")
+    return _normalize_text(s)
+
+
+
+def _normalize_filename_stem(stem: str) -> str:
+    """Normalize a file stem so clause-number parsing is resilient.
+
+    Handles:
+      - mojibake prefixes like 'â€58. ...'
+      - BOM/zero-width chars
+      - leading punctuation/bullets before the number
+    """
+    s = (stem or "").strip()
+    if not s:
+        return s
+    s = _normalize_text(s)
+    s = s.strip()
+    # Remove leading junk before first alnum/digit (but keep digits that follow)
+    s = re.sub(r"^[^0-9A-Za-z]+", "", s)
+    return s.strip()
 
 
 def policy_id_from_path(path: Path) -> str:
-    stem = path.stem.strip()
+    stem = _normalize_filename_stem(path.stem)
     stem = re.sub(r"[^a-zA-Z0-9]+", "-", stem).strip("-").upper()
     return f"POLICY-{stem}"
 
@@ -193,7 +254,7 @@ def parse_policy_filename(name: str) -> Dict[str, Any]:
 
     Returns metadata fields used later for deterministic filtering.
     """
-    stem = (name or "").strip()
+    stem = _normalize_filename_stem(name)
     m = FILENAME_CLAUSE_RE.match(stem)
     if not m:
         # If it doesn't match the convention, treat as global guidance.
@@ -392,11 +453,26 @@ async def main() -> None:
         total_chunks = 0
         total_docs = 0
 
+        parsed_ok = 0
+        parsed_null = 0
+        parsed_null_examples: List[str] = []
+
         for f in files:
             text = read_text(f)
-            title = first_heading(text) or f.stem
+            title = first_heading(text) or _normalize_filename_stem(f.stem)
             policy_id = policy_id_from_path(f)
-            filename_meta = parse_policy_filename(f.stem)
+            filename_meta = parse_policy_filename(_normalize_filename_stem(f.stem))
+
+            if filename_meta.get("clause_number"):
+                parsed_ok += 1
+            else:
+                parsed_null += 1
+                if len(parsed_null_examples) < 10:
+                    parsed_null_examples.append(f.stem)
+            if filename_meta.get("clause_number") is None:
+                norm_stem = _normalize_filename_stem(f.stem)
+                if re.match(r"^\d+", norm_stem):
+                    print(f"[seed][warn] Could not parse clause_number from filename stem: {f.stem!r} (normalized={norm_stem!r})")
 
             chunks = chunk_text(text, chunk_size=args.chunk_size, overlap=args.overlap)
             if not chunks:
@@ -442,6 +518,12 @@ async def main() -> None:
             total_docs += 1
             total_chunks += len(chunks)
             print(f"[seed] Upserted {len(chunks):3d} chunks from {f.name} -> {policy_id}")
+
+        print(f"[seed] Filename parse: clause_number parsed={parsed_ok} null={parsed_null}")
+        if parsed_null_examples:
+            print("[seed] Examples with null clause_number (first 10):")
+            for ex in parsed_null_examples:
+                print(f"  - {ex}")
 
         print(f"[seed] Done. Docs={total_docs}  Chunks={total_chunks}  Collection='{collection}'")
 
