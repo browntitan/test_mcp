@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from ..config import get_settings
 from ..schemas import PolicyCitation
+
+logger = logging.getLogger(__name__)
 
 
 # -----------------------------
@@ -289,6 +292,14 @@ class PgVectorPolicyRetriever:
         top_k = int(top_k or settings.policy_top_k_default)
         top_k = max(1, min(50, top_k))
 
+        logger.info(
+            "PGVECTOR: search start collection=%s top_k=%s min_score=%s filters=%s",
+            collection,
+            top_k,
+            min_score,
+            (filters or {}),
+        )
+
         use_embedder = embedder or self._embedder
         if use_embedder is None:
             raise RuntimeError(
@@ -298,15 +309,42 @@ class PgVectorPolicyRetriever:
             )
 
         raw_vec = await _maybe_await(use_embedder(query))
+
+        # Debug: embedding shape before coercion
+        try:
+            if isinstance(raw_vec, (list, tuple)) and raw_vec and isinstance(raw_vec[0], (list, tuple)):
+                logger.debug("PGVECTOR: raw_vec looks batched batch_size=%s first_len=%s", len(raw_vec), len(raw_vec[0]))
+            elif isinstance(raw_vec, (list, tuple)):
+                logger.debug("PGVECTOR: raw_vec len=%s", len(raw_vec))
+            else:
+                logger.debug("PGVECTOR: raw_vec type=%s", type(raw_vec).__name__)
+        except Exception:
+            pass
+
         # Validate and normalize embeddings against configured dimension (e.g., Ada-002 is 1536).
         vec_list = _coerce_embedding(raw_vec, expected_dim=getattr(settings, "embeddings_dim", None))
+        expected_dim = getattr(settings, "embeddings_dim", None)
+        logger.info(
+            "PGVECTOR: embedding coerced vec_len=%s expected_dim=%s",
+            len(vec_list),
+            expected_dim,
+        )
         vec_lit = _vector_literal(vec_list)
 
         filter_sql, filter_params = _build_filter_sql(filters or {}, cfg)
 
+        # Debug: show computed filter SQL (but do not log the query vector)
+        try:
+            logger.debug(
+                "PGVECTOR: filter_sql=%s filter_params=%s",
+                filter_sql,
+                {k: v for k, v in (filter_params or {}).items()},
+            )
+        except Exception:
+            pass
+
         # Score definition: 1 - cosine_distance
         # Distance operator '<=>' is cosine distance in pgvector.
-        expected_dim = getattr(settings, "embeddings_dim", None)
         vec_cast = f"::vector({int(expected_dim)})" if expected_dim else "::vector"
         distance_expr = f"{embedding_col} {cfg.distance_operator} (%(qvec)s){vec_cast}"
         score_expr = f"(1 - ({distance_expr}))"
@@ -328,6 +366,13 @@ class PgVectorPolicyRetriever:
             LIMIT %(top_k)s
         """.strip()
 
+        logger.debug(
+            "PGVECTOR: sql ready where_clause=%s distance_op=%s table=%s",
+            where_clause,
+            cfg.distance_operator,
+            table,
+        )
+
         params: Dict[str, Any] = {
             "qvec": vec_lit,
             "collection": collection,
@@ -346,6 +391,7 @@ class PgVectorPolicyRetriever:
                 async with conn.cursor() as cur:
                     await cur.execute(sql, params)
                     rows = await cur.fetchall()
+                    logger.info("PGVECTOR: rows_returned=%s (pool)", len(rows))
         else:
             import psycopg
 
@@ -356,6 +402,7 @@ class PgVectorPolicyRetriever:
                 async with conn.cursor() as cur:
                     await cur.execute(sql, params)
                     rows = await cur.fetchall()
+                    logger.info("PGVECTOR: rows_returned=%s", len(rows))
 
         out: List[PolicyCitation] = []
         for policy_id, chunk_id, text, metadata, score in rows:
@@ -380,6 +427,16 @@ class PgVectorPolicyRetriever:
                     metadata=md,
                 )
             )
+
+        if out:
+            logger.info(
+                "PGVECTOR: top_hit policy_id=%s chunk_id=%s score=%s",
+                out[0].policy_id,
+                out[0].chunk_id,
+                out[0].score,
+            )
+        else:
+            logger.info("PGVECTOR: no hits")
 
         return out
 
