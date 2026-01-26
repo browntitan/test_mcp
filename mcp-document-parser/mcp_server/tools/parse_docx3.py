@@ -89,6 +89,7 @@ _REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 _REL_TAG = f"{{{_REL_NS}}}Relationship"
 
 
+
 def _normalize_termset_suffix(s: str) -> Optional[str]:
     s = (s or "").strip()
     if not s:
@@ -102,6 +103,30 @@ def _normalize_termset_suffix(s: str) -> Optional[str]:
         except Exception:
             return s
     return s
+
+
+# Helper: scan a single footer XML part for CTM-P-ST-xxx, return normalized numeric suffix.
+def _scan_footer_xml_for_termset(footer_xml: bytes) -> Optional[str]:
+    """Scan a single footer XML part for a CTM-P-ST-xxx token and return the normalized numeric suffix."""
+    try:
+        footer_root = etree.fromstring(footer_xml)
+    except Exception:
+        return None
+
+    texts = [t.text for t in footer_root.findall(".//w:t", namespaces=NAMESPACES) if t.text]
+    if not texts:
+        return None
+
+    # Footers often split tokens across runs; try both concatenated and spaced variants.
+    cand1 = "".join(texts)
+    cand2 = " ".join(texts)
+
+    for cand in (cand1, cand2):
+        m = _TERMSET_FOOTER_RE.search(cand or "")
+        if m:
+            return _normalize_termset_suffix(m.group(1) or "")
+
+    return None
 
 
 def _extract_termset_id_from_docx(z: zipfile.ZipFile) -> Optional[str]:
@@ -143,8 +168,16 @@ def _extract_termset_id_from_docx(z: zipfile.ZipFile) -> Optional[str]:
         ordered.append(t)
 
     for tgt in ordered:
-        # Targets are typically like "footer1.xml"; occasionally they can be prefixed.
-        norm = tgt.lstrip("/")
+        # Targets are typically like "footer1.xml"; occasionally they can be prefixed (./ or ../).
+        norm = (tgt or "").strip()
+        if not norm:
+            continue
+        norm = norm.lstrip("/")
+        while norm.startswith("./"):
+            norm = norm[2:]
+        while norm.startswith("../"):
+            norm = norm[3:]
+
         if norm.startswith("word/"):
             footer_path = norm
         else:
@@ -155,23 +188,24 @@ def _extract_termset_id_from_docx(z: zipfile.ZipFile) -> Optional[str]:
         except KeyError:
             continue
 
-        try:
-            footer_root = etree.fromstring(footer_xml)
-        except Exception:
-            continue
+        found = _scan_footer_xml_for_termset(footer_xml)
+        if found:
+            return found
 
-        texts = [t.text for t in footer_root.findall(".//w:t", namespaces=NAMESPACES) if t.text]
-        if not texts:
-            continue
-
-        # Footers often split tokens across runs; try both concatenated and spaced variants.
-        cand1 = "".join(texts)
-        cand2 = " ".join(texts)
-
-        for cand in (cand1, cand2):
-            m = _TERMSET_FOOTER_RE.search(cand or "")
-            if m:
-                return _normalize_termset_suffix(m.group(1) or "")
+    # Fallback: scan any footer parts in the archive even if relationships are missing/unusual.
+    try:
+        for name in z.namelist():
+            if not name.startswith("word/footer") or not name.lower().endswith(".xml"):
+                continue
+            try:
+                footer_xml = z.read(name)
+            except KeyError:
+                continue
+            found = _scan_footer_xml_for_termset(footer_xml)
+            if found:
+                return found
+    except Exception:
+        pass
 
     return None
 

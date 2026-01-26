@@ -415,6 +415,11 @@ class RiskAssessmentStartOutput(BaseModel):
     status: Literal["queued", "running", "completed", "failed"]
     document: DocumentMetadata
     clause_count: int
+
+    # Effective termset id used for policy retrieval (normalized, e.g., "2" -> "002").
+    # This is typically captured from the DOCX footer token like "CTM-P-ST-002".
+    termset_id: Optional[str] = None
+
     warnings: List[str] = Field(default_factory=list)
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -23,6 +24,52 @@ from ..config import get_settings
 
 
 logger = logging.getLogger(__name__)
+
+# Best-effort termset id extraction from warnings/messages.
+_TERMSET_ANY_RE = re.compile(
+    r"(?:\btermset[_ ]?id\b\s*=?\s*|Auto-detected\s+termset_id=|Provided\s+termset_id=|CTM\s*[-\u2010-\u2015\u2212]\s*P\s*[-\u2010-\u2015\u2212]\s*ST\s*[-\u2010-\u2015\u2212]\s*)(\d{1,6})",
+    re.IGNORECASE,
+)
+
+
+def _normalize_termset_id(v: Any) -> Optional[str]:
+    """Normalize a numeric termset id to a 3-digit string (e.g., 2 -> "002")."""
+    if v is None:
+        return None
+    try:
+        s = str(v).strip()
+    except Exception:
+        return None
+    if not s:
+        return None
+    if s.isdigit() and len(s) <= 3:
+        try:
+            return f"{int(s):03d}"
+        except Exception:
+            return s
+    return s
+
+
+def _extract_termset_id_from_messages(messages: Any) -> Optional[str]:
+    """Extract a termset id from a list/string of messages (warnings, info, etc.)."""
+    if messages is None:
+        return None
+
+    if isinstance(messages, str):
+        m = _TERMSET_ANY_RE.search(messages)
+        return _normalize_termset_id(m.group(1)) if m else None
+
+    if isinstance(messages, list):
+        for it in messages:
+            try:
+                s = str(it)
+            except Exception:
+                continue
+            m = _TERMSET_ANY_RE.search(s)
+            if m:
+                return _normalize_termset_id(m.group(1))
+
+    return None
 
 
 def _not_found(name: str, assessment_id: str) -> ValueError:
@@ -115,7 +162,12 @@ def _compute_totals(results: List[Any]) -> Dict[str, Any]:
     return {"total": total, "low": low, "medium": medium, "high": high, "avg_score": avg}
 
 
-def _render_report_markdown(report: RiskAssessmentReportOutput) -> str:
+def _render_report_markdown(
+    report: RiskAssessmentReportOutput,
+    *,
+    termset_id: Optional[str] = None,
+    policy_collection: Optional[str] = None,
+) -> str:
     totals = report.totals or _compute_totals(report.clause_results)
 
     lines: List[str] = []
@@ -123,6 +175,12 @@ def _render_report_markdown(report: RiskAssessmentReportOutput) -> str:
     lines.append("")
     lines.append(f"**Status:** {report.status}")
     lines.append("")
+    if termset_id:
+        lines.append(f"**Termset ID:** {termset_id}")
+        lines.append("")
+    if policy_collection:
+        lines.append(f"**Policy collection:** {policy_collection}")
+        lines.append("")
     lines.append("## Summary")
     lines.append("")
     lines.append(report.summary.strip() if report.summary else "(no summary)")
@@ -222,16 +280,45 @@ async def risk_assessment_start(input_data: RiskAssessmentStartInput) -> RiskAss
                 "risk_assessment.start: when using file_base64 without file_path/filename, you must provide file_type='docx'|'pdf'"
             )
 
+    requested_termset_id = _normalize_termset_id(getattr(input_data, "termset_id", None))
+
     logger.info(
         "risk_assessment.start called (mode=%s, model_profile=%s, top_k=%s, collection=%s, termset_id=%s)",
         getattr(input_data, "mode", None),
         getattr(input_data, "model_profile", None),
         getattr(input_data, "top_k", None),
         getattr(input_data, "policy_collection", None),
-        getattr(input_data, "termset_id", None),
+        requested_termset_id,
     )
 
     out = await start_risk_assessment(input_data)
+
+    # Determine the effective termset id used for retrieval.
+    effective_termset_id: Optional[str] = requested_termset_id
+    try:
+        store = get_store()
+        rec = await store.get(out.assessment_id)
+        if rec is not None:
+            # Prefer what the parser captured on the document metadata; fall back to rag snapshot; then warnings.
+            effective_termset_id = (
+                effective_termset_id
+                or _normalize_termset_id((rec.document or {}).get("termset_id"))
+                or _normalize_termset_id((rec.rag or {}).get("termset_id"))
+                or _extract_termset_id_from_messages(getattr(rec, "warnings", None))
+            )
+    except Exception as e:
+        logger.warning(
+            "Failed to resolve effective termset id for assessment_id=%s: %s",
+            getattr(out, "assessment_id", None),
+            e,
+        )
+
+    # If the output schema supports termset_id, include it so clients/pipelines can display it reliably.
+    try:
+        if "termset_id" in getattr(out.__class__, "model_fields", {}):
+            out = out.model_copy(update={"termset_id": effective_termset_id})
+    except Exception:
+        pass
 
     # Persist RAG / retrieval configuration snapshot for auditability/debugging.
     # This is safe even if the runner also sets it; store.set_rag will just overwrite.
@@ -239,7 +326,8 @@ async def risk_assessment_start(input_data: RiskAssessmentStartInput) -> RiskAss
         settings = get_settings()
         rag = {
             "policy_collection": getattr(input_data, "policy_collection", None),
-            "termset_id": getattr(input_data, "termset_id", None),
+            "termset_id": effective_termset_id,
+            "requested_termset_id": requested_termset_id,
             "filters": getattr(input_data, "filters", None) or {},
             "top_k": getattr(input_data, "top_k", None),
             "min_score": getattr(input_data, "min_score", None),
@@ -253,10 +341,11 @@ async def risk_assessment_start(input_data: RiskAssessmentStartInput) -> RiskAss
         logger.warning("Failed to persist RAG config for assessment_id=%s: %s", getattr(out, "assessment_id", None), e)
 
     logger.info(
-        "risk_assessment.start returning (assessment_id=%s, status=%s, clause_count=%s)",
+        "risk_assessment.start returning (assessment_id=%s, status=%s, clause_count=%s, termset_id=%s)",
         out.assessment_id,
         out.status,
         out.clause_count,
+        effective_termset_id,
     )
     return out
 
@@ -309,8 +398,22 @@ async def risk_assessment_report(input_data: RiskAssessmentReportInput) -> RiskA
     if not out.totals:
         out = out.model_copy(update={"totals": _compute_totals(out.clause_results)})
 
+    termset_id: Optional[str] = None
+    policy_collection: Optional[str] = None
+    try:
+        rec = await store.get(out.assessment_id)
+        if rec is not None:
+            termset_id = (
+                _normalize_termset_id((rec.document or {}).get("termset_id"))
+                or _normalize_termset_id((rec.rag or {}).get("termset_id"))
+                or _extract_termset_id_from_messages(getattr(rec, "warnings", None))
+            )
+            policy_collection = (rec.rag or {}).get("policy_collection")
+    except Exception:
+        pass
+
     if input_data.format == "markdown":
-        md = _render_report_markdown(out)
+        md = _render_report_markdown(out, termset_id=termset_id, policy_collection=policy_collection)
         out = out.model_copy(update={"summary": md})
 
     logger.info(
