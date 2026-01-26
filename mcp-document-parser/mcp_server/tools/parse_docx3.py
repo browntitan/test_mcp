@@ -72,7 +72,108 @@ NUMERIC_RE = re.compile(r"^\s*((?:\d+\.)+\d+|\d+\.?)(?=\s)\s+(.+)$")
 PAREN_ALPHA_RE = re.compile(r"^\s*(\([a-z]\))(?=\s)\s+(.+)$", re.IGNORECASE)
 PAREN_ROMAN_RE = re.compile(r"^\s*(\([ivxlcdm]+\))(?=\s)\s+(.+)$", re.IGNORECASE)
 
+
 TOC_STYLE_RE = re.compile(r"^TOC\d+$", re.IGNORECASE)
+
+# -----------------------------
+# Termset extraction (footer)
+# -----------------------------
+# Expected footer token: "CTM-P-ST-002" -> termset_id="002" (numeric suffix only)
+# We normalize 1-3 digit values to 3 digits so it aligns with policy metadata (e.g., 2 -> 002).
+_TERMSET_FOOTER_RE = re.compile(
+    r"CTM\s*[-\u2010-\u2015\u2212]\s*P\s*[-\u2010-\u2015\u2212]\s*ST\s*[-\u2010-\u2015\u2212]\s*(\d{1,6})",
+    re.IGNORECASE,
+)
+
+_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_REL_TAG = f"{{{_REL_NS}}}Relationship"
+
+
+def _normalize_termset_suffix(s: str) -> Optional[str]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    if not s.isdigit():
+        return s
+    # normalize 1-3 digits to 3-digit strings; keep longer values as-is
+    if len(s) <= 3:
+        try:
+            return f"{int(s):03d}"
+        except Exception:
+            return s
+    return s
+
+
+def _extract_termset_id_from_docx(z: zipfile.ZipFile) -> Optional[str]:
+    """Best-effort extraction of a termset id from DOCX footers.
+
+    Strategy:
+      1) Read `word/_rels/document.xml.rels` to find footer relationship targets.
+      2) Scan each referenced `word/footer*.xml` for a token like CTM-P-ST-002.
+      3) Return only the numeric suffix (e.g., "002").
+    """
+    try:
+        rels_xml = z.read("word/_rels/document.xml.rels")
+    except KeyError:
+        return None
+
+    try:
+        rels_root = etree.fromstring(rels_xml)
+    except Exception:
+        return None
+
+    targets: List[str] = []
+    for rel in rels_root.findall(f".//{_REL_TAG}"):
+        typ = (rel.get("Type") or "").strip()
+        if typ.endswith("/footer"):
+            tgt = (rel.get("Target") or "").strip()
+            if tgt:
+                targets.append(tgt)
+
+    if not targets:
+        return None
+
+    # De-dup targets while preserving order
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for t in targets:
+        if t in seen:
+            continue
+        seen.add(t)
+        ordered.append(t)
+
+    for tgt in ordered:
+        # Targets are typically like "footer1.xml"; occasionally they can be prefixed.
+        norm = tgt.lstrip("/")
+        if norm.startswith("word/"):
+            footer_path = norm
+        else:
+            footer_path = "word/" + norm
+
+        try:
+            footer_xml = z.read(footer_path)
+        except KeyError:
+            continue
+
+        try:
+            footer_root = etree.fromstring(footer_xml)
+        except Exception:
+            continue
+
+        texts = [t.text for t in footer_root.findall(".//w:t", namespaces=NAMESPACES) if t.text]
+        if not texts:
+            continue
+
+        # Footers often split tokens across runs; try both concatenated and spaced variants.
+        cand1 = "".join(texts)
+        cand2 = " ".join(texts)
+
+        for cand in (cand1, cand2):
+            m = _TERMSET_FOOTER_RE.search(cand or "")
+            if m:
+                return _normalize_termset_suffix(m.group(1) or "")
+
+    return None
 
 
 def _numeric_depth(label: str) -> int:
@@ -961,6 +1062,11 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
             except KeyError as e:
                 raise ValueError("Invalid DOCX: missing word/document.xml") from e
 
+            # Termset id (CTM-P-ST-xxx) is expected in the footer. Extract the numeric suffix (e.g., 002).
+            termset_id = _extract_termset_id_from_docx(z)
+            if not termset_id:
+                warnings.append("No termset id found in document footer (expected pattern CTM-P-ST-xxx).")
+
             # Styles outline map (best-effort)
             style_outline = _load_style_outline_levels(z)
 
@@ -1257,6 +1363,7 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                     media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     pages=None,
                     word_count=0,
+                    termset_id=termset_id,
                 )
                 warnings.append("No clauses detected (document may be empty or fully skipped as TOC).")
                 return DocumentParseResult(document=meta, clauses=[], warnings=warnings)
@@ -1292,6 +1399,7 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                 media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 pages=None,
                 word_count=word_count,
+                termset_id=termset_id,
             )
 
             if input_data.options.extract_comments and not comments_map:

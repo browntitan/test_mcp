@@ -74,11 +74,30 @@ def _infer_file_type(file_path: Optional[str], filename: Optional[str], explicit
     return None
 
 
+
 def _norm_profile_name(name: Optional[str]) -> Optional[str]:
     if name is None:
         return None
     n = str(name).strip()
     return n or None
+
+
+def _normalize_termset_id(v: Any) -> Optional[str]:
+    """Normalize a numeric termset id to a 3-digit string (e.g., 2 -> "002")."""
+    if v is None:
+        return None
+    try:
+        s = str(v).strip()
+    except Exception:
+        return None
+    if not s:
+        return None
+    if s.isdigit():
+        try:
+            return f"{int(s):03d}"
+        except Exception:
+            return s
+    return s
 
 
 def _resolve_profile(settings: Any, preferred: Optional[str], *, fallback: Optional[str]) -> str:
@@ -281,6 +300,31 @@ async def start_risk_assessment(start: RiskAssessmentStartInput) -> RiskAssessme
 
     parse_result, warnings = await _load_or_parse(start)
 
+    # Auto-populate termset_id from parsed document metadata (DOCX footer extraction) if caller did not provide one.
+    doc_ts = _normalize_termset_id(getattr(getattr(parse_result, "document", None), "termset_id", None))
+    caller_ts = _normalize_termset_id(getattr(start, "termset_id", None))
+
+    if caller_ts and doc_ts and caller_ts != doc_ts:
+        warnings.append(
+            f"Provided termset_id={caller_ts} differs from parsed document termset_id={doc_ts}; using provided value."
+        )
+        # Ensure we use the normalized caller termset id going forward.
+        start = start.model_copy(update={"termset_id": caller_ts})
+    elif (not caller_ts) and doc_ts:
+        warnings.append(f"Auto-detected termset_id={doc_ts} from document footer.")
+        start = start.model_copy(update={"termset_id": doc_ts})
+    elif caller_ts:
+        # Normalize caller input even if the document did not provide one.
+        start = start.model_copy(update={"termset_id": caller_ts})
+
+    logger.info(
+        "risk_assessment start (file=%s mode=%s termset_id=%s policy_collection=%s)",
+        getattr(parse_result.document, "filename", None),
+        start.mode,
+        getattr(start, "termset_id", None) or "NONE",
+        getattr(start, "policy_collection", None),
+    )
+
     clause_ids_all = [c.clause_id for c in parse_result.clauses]
     focus_clause_ids = start.focus_clause_ids
     if focus_clause_ids:
@@ -377,9 +421,11 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
 
         await store.set_status(assessment_id, "running")
         logger.info(
-            "risk_assessment running (assessment_id=%s, clauses=%s, assessment_profile=%s, embeddings_profile=%s)",
+            "risk_assessment running (assessment_id=%s, clauses=%s, termset_id=%s, policy_collection=%s, assessment_profile=%s, embeddings_profile=%s)",
             assessment_id,
             len(parse_result.clauses),
+            getattr(start, "termset_id", None) or "NONE",
+            getattr(start, "policy_collection", None),
             assessment_profile,
             embeddings_profile,
         )
@@ -771,6 +817,7 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
 
         lines: List[str] = []
         lines.append(f"Document: {parse_result.document.filename}")
+        lines.append(f"Termset: {getattr(start, 'termset_id', None) or getattr(parse_result.document, 'termset_id', None) or 'NONE'}")
         lines.append(f"Totals: {totals}")
         if top_high:
             lines.append("Top High Risk Clauses:")

@@ -119,6 +119,9 @@ class DocumentMetadata(BaseModel):
     ]
     pages: Optional[int] = None
     word_count: Optional[int] = None
+    # Optional contract termset identifier, typically extracted from the document footer.
+    # Example footer token: "CTM-P-ST-002" -> termset_id="002".
+    termset_id: Optional[str] = None
 
 
 class DocumentParseResult(BaseModel):
