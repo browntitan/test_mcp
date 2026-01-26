@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,7 +31,35 @@ from ...workflows.risk_assessment.store import get_store
 
 
 
+
 logger = logging.getLogger(__name__)
+
+
+def _prompt_fingerprint(text: str) -> str:
+    """Short SHA256 fingerprint for logging (avoid leaking full prompt text)."""
+    try:
+        return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12]
+    except Exception:
+        return "unknown"
+
+
+# Default clause-by-clause system prompt (used unless overridden by env settings).
+DEFAULT_RISK_ASSESSMENT_SYSTEM_PROMPT = (
+    "You are a contract risk assessment engine. "
+    "Return ONLY one valid JSON object that matches the required schema EXACTLY. "
+    "No markdown fences, no prose, no trailing text. "
+    "Enums: risk_level must be one of low|medium|high; issues[].severity must be one of low|medium|high. "
+    "Limits: issues <= 5; citations <= 5; each citations[].text <= 240 chars; keep justification concise (<= 6 sentences). "
+    "Citations rule: ONLY cite from the provided policy excerpts; if no excerpts apply, return citations as an empty list. "
+    "If output might be too long, shorten justification/citation snippets; NEVER output incomplete JSON."
+)
+
+
+# Default summary system prompt (used unless overridden by env settings).
+DEFAULT_RISK_SUMMARY_SYSTEM_PROMPT = (
+    "You are summarizing a clause-by-clause contract risk assessment for a busy stakeholder. "
+    "Produce a concise executive summary, key themes, and recommended next steps."
+)
 
 _CLAUSE_NUMBER_RE = re.compile(r"^\s*(\d+(?:\.\d+)*)")
 
@@ -430,6 +459,34 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
             embeddings_profile,
         )
 
+        # Resolve configurable system prompts (env/file) with defaults.
+        clause_sys_override = getattr(settings, "risk_assessment_system_prompt", None)
+        clause_sys = clause_sys_override if (clause_sys_override and str(clause_sys_override).strip()) else DEFAULT_RISK_ASSESSMENT_SYSTEM_PROMPT
+        clause_src = (
+            getattr(settings, "risk_assessment_system_prompt_source", "default")
+            if (clause_sys_override and str(clause_sys_override).strip())
+            else "default"
+        )
+
+        summary_sys_override = getattr(settings, "risk_summary_system_prompt", None)
+        summary_sys = summary_sys_override if (summary_sys_override and str(summary_sys_override).strip()) else DEFAULT_RISK_SUMMARY_SYSTEM_PROMPT
+        summary_src = (
+            getattr(settings, "risk_summary_system_prompt_source", "default")
+            if (summary_sys_override and str(summary_sys_override).strip())
+            else "default"
+        )
+
+        logger.info(
+            "risk_assessment prompts (assessment_id=%s clause_prompt_source=%s clause_prompt_sha=%s clause_prompt_len=%s summary_prompt_source=%s summary_prompt_sha=%s summary_prompt_len=%s)",
+            assessment_id,
+            clause_src,
+            _prompt_fingerprint(clause_sys),
+            len(clause_sys or ""),
+            summary_src,
+            _prompt_fingerprint(summary_sys),
+            len(summary_sys or ""),
+        )
+
         # Resolve clauses
         clause_map: Dict[str, Clause] = {c.clause_id: c for c in parse_result.clauses}
         clause_order = [c.clause_id for c in parse_result.clauses]
@@ -666,14 +723,7 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                 policy_block = "No relevant policy context was retrieved. Use general best practices and legal reasoning."
 
             # Ask model for a ClauseAssessment JSON (robust + bounded).
-            base_sys = (
-                "You are a contract risk assessment engine. "
-                "Return ONLY one valid JSON object that matches the required schema EXACTLY. "
-                "No markdown fences, no prose, no trailing text. "
-                "Enums: risk_level must be one of low|medium|high; issues[].severity must be one of low|medium|high. "
-                "Limits: issues <= 5; citations <= 5; each citations[].text <= 240 chars; keep justification concise (<= 6 sentences). "
-                "If output might be too long, shorten justification/citation snippets; NEVER output incomplete JSON."
-            )
+            base_sys = clause_sys
 
             assessment: Optional[ClauseAssessment] = None
             last_err: Optional[Exception] = None
@@ -836,10 +886,7 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                 messages=[
                     ChatMessage(
                         role="system",
-                        content=(
-                            "You are summarizing a clause-by-clause contract risk assessment for a busy stakeholder. "
-                            "Produce a concise executive summary, key themes, and recommended next steps."
-                        ),
+                        content=summary_sys,
                     ),
                     ChatMessage(role="user", content=summary_seed),
                 ],

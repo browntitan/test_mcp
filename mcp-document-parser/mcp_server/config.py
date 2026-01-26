@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
@@ -14,6 +15,46 @@ def _s(v: Optional[str]) -> Optional[str]:
         return None
     vv = str(v).strip()
     return vv if vv else None
+
+
+def _normalize_prompt_text(text: str) -> str:
+    """Normalize prompt text loaded from env/file.
+
+    - Strips surrounding whitespace.
+    - Converts literal '\\n' sequences (common in env files) into real newlines.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    # Support env-file friendly newline encoding.
+    t = t.replace("\\n", "\n")
+    return t
+
+
+def _read_text_file(path_str: str) -> str:
+    p = Path(path_str).expanduser()
+    return p.read_text(encoding="utf-8")
+
+
+def _resolve_prompt(inline_value: Optional[str], file_path: Optional[str]) -> tuple[Optional[str], str]:
+    """Resolve a prompt from either a file path or an inline env value.
+
+    Precedence: file_path > inline_value > None
+    Returns: (prompt_text_or_None, source) where source is one of: 'file' | 'env' | 'default'
+    """
+    fp = _s(file_path)
+    iv = _s(inline_value)
+
+    if fp:
+        try:
+            return _normalize_prompt_text(_read_text_file(fp)), "file"
+        except Exception as e:
+            raise ValueError(f"Failed to read prompt file '{fp}': {e}")
+
+    if iv:
+        return _normalize_prompt_text(iv), "env"
+
+    return None, "default"
 
 
 class ModelProfile(BaseModel):
@@ -107,6 +148,24 @@ class Settings(BaseSettings):
     )
     policy_default_collection: str = Field(default="default", alias="POLICY_DEFAULT_COLLECTION")
     policy_top_k_default: int = Field(default=3, alias="POLICY_TOP_K_DEFAULT")
+
+    # -----------------
+    # Risk assessment prompts
+    # -----------------
+    # These allow you to override the default system prompts used by the risk assessment workflow.
+    # Prefer *_FILE for long prompts; it is easier to manage and avoids shell/env escaping issues.
+
+    # Clause-by-clause system prompt
+    risk_assessment_system_prompt: Optional[str] = Field(default=None, alias="RISK_ASSESSMENT_SYSTEM_PROMPT")
+    risk_assessment_system_prompt_file: Optional[str] = Field(default=None, alias="RISK_ASSESSMENT_SYSTEM_PROMPT_FILE")
+    # Where the prompt came from: file | env | default
+    risk_assessment_system_prompt_source: Literal["file", "env", "default"] = "default"
+
+    # Final summary system prompt
+    risk_summary_system_prompt: Optional[str] = Field(default=None, alias="RISK_SUMMARY_SYSTEM_PROMPT")
+    risk_summary_system_prompt_file: Optional[str] = Field(default=None, alias="RISK_SUMMARY_SYSTEM_PROMPT_FILE")
+    # Where the prompt came from: file | env | default
+    risk_summary_system_prompt_source: Literal["file", "env", "default"] = "default"
 
     # -----------------
     # Model profiles
@@ -277,6 +336,18 @@ class Settings(BaseSettings):
                 self.embeddings_dim = 1536
 
         self.model_profiles = built
+
+        # -----------------
+        # Resolve risk assessment prompts from env/file
+        # -----------------
+        prompt, src = _resolve_prompt(self.risk_assessment_system_prompt, self.risk_assessment_system_prompt_file)
+        self.risk_assessment_system_prompt = prompt
+        self.risk_assessment_system_prompt_source = src  # type: ignore[assignment]
+
+        sprompt, ssrc = _resolve_prompt(self.risk_summary_system_prompt, self.risk_summary_system_prompt_file)
+        self.risk_summary_system_prompt = sprompt
+        self.risk_summary_system_prompt_source = ssrc  # type: ignore[assignment]
+
         return self
 
 

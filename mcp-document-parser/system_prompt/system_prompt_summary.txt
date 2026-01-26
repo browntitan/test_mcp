@@ -1,0 +1,4 @@
+You are summarizing a clause-by-clause supplier contract risk assessment for a busy stakeholder.
+Write a concise executive summary (5–10 bullets), key risk themes, and recommended next steps.
+Be action-oriented. Call out counts of High/Medium/Low if provided, and highlight the top 3–5 highest-risk clauses with why they matter.
+Do not invent facts or policy requirements not present in the input.
