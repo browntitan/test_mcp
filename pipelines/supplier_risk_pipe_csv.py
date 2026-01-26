@@ -7,6 +7,7 @@ requirements: requests,pydantic
 
 import base64
 import os
+import re
 import time
 import asyncio
 import csv
@@ -157,6 +158,80 @@ class Pipeline:
         return None
 
     # -------------------------
+    # Termset helpers
+    # -------------------------
+    _TERMSET_RE_LIST = [
+        re.compile(r"\btermset[_ ]?id\s*=?\s*([0-9]{1,6})\b", re.IGNORECASE),
+        re.compile(r"\bTermset ID:\s*([0-9]{1,6})\b", re.IGNORECASE),
+        re.compile(r"\bTermset:\s*([0-9]{1,6})\b", re.IGNORECASE),
+        re.compile(
+            r"CTM\s*[-\u2010-\u2015\u2212]\s*P\s*[-\u2010-\u2015\u2212]\s*ST\s*[-\u2010-\u2015\u2212]\s*(\d{1,6})",
+            re.IGNORECASE,
+        ),
+    ]
+
+    def _normalize_termset_id(self, v: Any) -> str:
+        """Normalize numeric termset ids to 3 digits (e.g., 2 -> 002)."""
+        if v is None:
+            return ""
+        s = str(v).strip()
+        if not s:
+            return ""
+        if s.isdigit() and len(s) <= 3:
+            try:
+                return f"{int(s):03d}"
+            except Exception:
+                return s
+        return s
+
+    def _extract_termset_id_from_start(self, start_data: dict) -> str:
+        """Best-effort extraction of termset id returned by MCP start.
+
+        We try common shapes:
+          - start_data['termset_id']
+          - start_data['document']['termset_id']
+          - start_data['parse_result']['document']['termset_id']
+          - parse from warnings/messages (e.g., "Auto-detected termset_id=002 ...")
+          - parse from embedded CTM-P-ST-xxx tokens
+        """
+        if not isinstance(start_data, dict):
+            return ""
+
+        # Direct fields
+        for key in ("termset_id", "termset"):
+            if key in start_data and start_data.get(key) is not None:
+                return self._normalize_termset_id(start_data.get(key))
+
+        # Nested document metadata
+        doc = start_data.get("document")
+        if isinstance(doc, dict) and doc.get("termset_id") is not None:
+            return self._normalize_termset_id(doc.get("termset_id"))
+
+        pr = start_data.get("parse_result")
+        if isinstance(pr, dict):
+            d2 = pr.get("document")
+            if isinstance(d2, dict) and d2.get("termset_id") is not None:
+                return self._normalize_termset_id(d2.get("termset_id"))
+
+        # Parse from warnings/messages
+        msgs: List[str] = []
+        for k in ("warnings", "parse_warnings", "messages", "info"):
+            v = start_data.get(k)
+            if isinstance(v, list):
+                msgs.extend([str(x) for x in v if x is not None])
+            elif isinstance(v, str) and v.strip():
+                msgs.append(v)
+
+        blob = "\n".join(msgs)
+        if blob:
+            for rx in self._TERMSET_RE_LIST:
+                m = rx.search(blob)
+                if m:
+                    return self._normalize_termset_id(m.group(1))
+
+        return ""
+
+    # -------------------------
     # OpenWebUI + MCP helpers
     # -------------------------
     def _owui_headers(self) -> Dict[str, str]:
@@ -246,7 +321,7 @@ class Pipeline:
             return (v or "")
         return ""
 
-    def _build_csv_bytes(self, assessment_id: str, rep_json: dict) -> bytes:
+    def _build_csv_bytes(self, assessment_id: str, rep_json: dict, termset_id: str = "") -> bytes:
         """Build a CSV export from the JSON report."""
         summary = (rep_json.get("summary") or "").strip()
         totals = rep_json.get("totals") or {}
@@ -261,6 +336,8 @@ class Pipeline:
         # Metadata header rows
         w.writerow(["assessment_id", assessment_id])
         w.writerow(["generated_at", datetime.utcnow().isoformat() + "Z"])
+        if termset_id:
+            w.writerow(["termset_id", termset_id])
         if totals:
             w.writerow(["totals", str(totals)])
         if summary:
@@ -404,6 +481,14 @@ class Pipeline:
                 if not assessment_id:
                     raise ValueError(f"Missing assessment_id from MCP start response: {start_data}")
 
+                # Show the user which termset was captured/used (if available).
+                termset_id = self._extract_termset_id_from_start(start_data)
+                if termset_id:
+                    yield self._status_details("Termset detected", f"termset_id={termset_id}", done=False)
+                    yield f"Detected termset id: **{termset_id}**\n"
+                else:
+                    yield self._status_details("Termset detected", "NONE (not found)", done=False)
+
                 yield self._status_details("Assessment started", f"id={assessment_id}", done=False)
 
                 last_line = ""
@@ -442,6 +527,10 @@ class Pipeline:
                 if not content:
                     content = f"Assessment {assessment_id} finished, but report text was empty."
 
+                # Prepend termset id for clarity in the UI.
+                if termset_id:
+                    content = f"**Termset ID:** {termset_id}\n\n" + content
+
                 csv_download_url = ""
                 csv_download_path = ""  # relative path is most reliable inside OpenWebUI
                 csv_filename = ""
@@ -454,7 +543,7 @@ class Pipeline:
                         {"assessment_id": assessment_id, "format": "json"},
                     )
 
-                    csv_bytes = self._build_csv_bytes(assessment_id, rep_json)
+                    csv_bytes = self._build_csv_bytes(assessment_id, rep_json, termset_id=termset_id)
                     csv_filename = f"risk_report_{assessment_id}.csv"
                     file_id2 = self._owui_upload_bytes(csv_filename, csv_bytes, "text/csv")
 
