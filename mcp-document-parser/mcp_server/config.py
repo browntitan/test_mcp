@@ -155,6 +155,11 @@ class Settings(BaseSettings):
     policy_default_collection: str = Field(default="default", alias="POLICY_DEFAULT_COLLECTION")
     policy_top_k_default: int = Field(default=3, alias="POLICY_TOP_K_DEFAULT")
 
+    # When true, if we cannot extract a clause_number from the clause label/title,
+    # the risk-assessment workflow will derive a numeric clause_number from the internal
+    # clause_id token (e.g., clause_0004_xxx -> "4"). This helps avoid termset-only fallback.
+    rag_use_clause_id_fallback: bool = Field(default=True, alias="RAG_USE_CLAUSE_ID_FALLBACK")
+
     # -----------------
     # Risk assessment prompts
     # -----------------

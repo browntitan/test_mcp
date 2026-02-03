@@ -70,6 +70,9 @@ _CLAUSE_NUMBER_RE = re.compile(r"^\s*(\d+(?:\.\d+)*)")
 _SECTION_NUMBER_RE = re.compile(r"^\s*SECTION\s+(\d+(?:\.\d+)*)", re.IGNORECASE)
 _CLAUSE_PREFIX_NUMBER_RE = re.compile(r"^\s*CLAUSE\s+(\d+(?:\.\d+)*)", re.IGNORECASE)
 
+# Internal clause_id index extraction (e.g., clause_0004_7eca2353)
+_CLAUSE_ID_INDEX_RE = re.compile(r"^clause_(\d{4})_", re.IGNORECASE)
+
 
 def _extract_clause_number(label: Optional[str]) -> Optional[str]:
     """Extract a canonical clause number from common label formats.
@@ -101,6 +104,29 @@ def _extract_clause_number(label: Optional[str]) -> Optional[str]:
         return m.group(1)
 
     return None
+
+
+def _clause_number_from_clause_id(clause_id: Optional[str]) -> Optional[str]:
+    """Derive a numeric clause number from internal clause_id tokens.
+
+    We support ids like: 'clause_0004_7eca2353' -> '4'.
+    Returns None for 'clause_0000_...' which is commonly used for TOC / non-numbered content.
+
+    NOTE: This assumes the clause index embedded in clause_id aligns with the numeric clause_number
+    used by policy guidance filenames/metadata.
+    """
+    if not clause_id:
+        return None
+    m = _CLAUSE_ID_INDEX_RE.match(str(clause_id))
+    if not m:
+        return None
+    try:
+        n = int(m.group(1))
+    except Exception:
+        return None
+    if n <= 0:
+        return None
+    return str(n)
 
 # Prompt-size guards to reduce truncated/invalid JSON responses.
 MAX_CLAUSE_CHARS = 14000
@@ -605,17 +631,37 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                 base_filters: Dict[str, Any] = dict(start.filters or {})
 
                 # Derive a canonical clause number for deterministic narrowing.
-                # We primarily use the clause label, but fall back to title when needed.
+                # We primarily use the clause label, but fall back to title.
+                # If still missing, we attempt to derive from the internal clause_id token.
                 clause_number = (
                     _extract_clause_number(getattr(clause, "label", None))
                     or _extract_clause_number(getattr(clause, "title", None))
                 )
+
+                derived_from_cid = False
+                if (not clause_number) and bool(getattr(settings, "rag_use_clause_id_fallback", True)):
+                    cid_num = _clause_number_from_clause_id(cid)
+                    if cid_num:
+                        clause_number = cid_num
+                        derived_from_cid = True
+                elif not clause_number:
+                    logger.info(
+                        "RAG: clause_id-derived clause_number fallback disabled (clause_id=%s)",
+                        cid,
+                    )
+
                 if clause_number:
                     base_filters["clause_number"] = clause_number
+                    if derived_from_cid:
+                        logger.info(
+                            "RAG: clause_number derived from clause_id fallback (clause_id=%s derived_clause_number=%s)",
+                            cid,
+                            clause_number,
+                        )
                 else:
                     # If this happens, retrieval will not be clause-narrowed (only termset/caller filters apply).
                     logger.warning(
-                        "RAG: no clause_number extracted; clause narrowing disabled (clause_id=%s label=%r title=%r)",
+                        "RAG: no clause_number available (label/title parse failed and clause_id fallback not applicable); clause narrowing disabled (clause_id=%s label=%r title=%r)",
                         cid,
                         getattr(clause, "label", None),
                         getattr(clause, "title", None),
