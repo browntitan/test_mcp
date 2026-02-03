@@ -137,7 +137,13 @@ class Settings(BaseSettings):
     # -----------------
     host: str = Field(default="0.0.0.0", alias="MCP_SERVER_HOST")
     port: int = Field(default=8765, alias="MCP_SERVER_PORT")
+
+    # Root/application log level. Use DEBUG to enable deep RAG/pgvector diagnostics.
+    # Allowed: CRITICAL, ERROR, WARNING, INFO, DEBUG, NOTSET
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    # Uvicorn log level (optional). If unset/blank, defaults to LOG_LEVEL (lower-cased).
+    uvicorn_log_level: Optional[str] = Field(default=None, alias="UVICORN_LOG_LEVEL")
 
     # -----------------
     # Policy DB / RAG
@@ -221,6 +227,20 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _build_profiles(self) -> "Settings":
+        # -----------------
+        # Normalize/validate logging settings early
+        # -----------------
+        lvl = (self.log_level or "INFO").strip().upper()
+        allowed = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
+        if lvl not in allowed:
+            raise ValueError(f"LOG_LEVEL must be one of {sorted(allowed)} (got {self.log_level!r})")
+        self.log_level = lvl
+
+        # If UVICORN_LOG_LEVEL is not set, mirror LOG_LEVEL (uvicorn expects lower-case names).
+        if self.uvicorn_log_level and str(self.uvicorn_log_level).strip():
+            self.uvicorn_log_level = str(self.uvicorn_log_level).strip().lower()
+        else:
+            self.uvicorn_log_level = lvl.lower()
         profiles: Dict[str, Any] = {}
 
         # 1) Explicit JSON profiles win.

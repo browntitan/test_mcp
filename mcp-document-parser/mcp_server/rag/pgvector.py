@@ -161,18 +161,35 @@ def _build_filter_sql(filters: Dict[str, Any], cfg: PgVectorSearchConfig) -> Tup
     # filters["termset"] is treated specially:
     #   include rows where applies_to_all_termsets is true (or missing)
     #   OR termsets contains the termset id as a string element.
+    #
+    # NOTE: Different seeders may store termsets either as plain numbers ("3") or zero-padded ("003").
+    # To be robust, if the input is numeric we match BOTH forms.
     if "termset" in filters and filters["termset"] is not None:
-        ts_raw = str(filters["termset"]).strip()
-        if ts_raw:
-            # Normalize numeric termsets to 3-digit strings to match seeding (e.g., "3" -> "003").
-            if ts_raw.isdigit():
-                ts_raw = f"{int(ts_raw):03d}"
+        ts_in = str(filters["termset"]).strip()
+        if ts_in:
+            ts_alt: Optional[str] = None
+            if ts_in.isdigit():
+                ts_alt = f"{int(ts_in):03d}"
+                if ts_alt == ts_in:
+                    ts_alt = None
+
+            # Build a membership clause that checks termsets for either representation.
+            termset_clause = "(" + cfg.metadata_column + " -> 'termsets') ? %(termset)s"
+            params["termset"] = ts_in
+            if ts_alt:
+                termset_clause += " OR (" + cfg.metadata_column + " -> 'termsets') ? %(termset_alt)s"
+                params["termset_alt"] = ts_alt
 
             clauses.append(
                 "(COALESCE((" + cfg.metadata_column + " ->> 'applies_to_all_termsets')::boolean, true) = true "
-                " OR (" + cfg.metadata_column + " -> 'termsets') ? %(termset)s)"
+                " OR " + termset_clause + ")"
             )
-            params["termset"] = ts_raw
+
+            logger.debug(
+                "PGVECTOR: termset normalized input=%r alt=%r",
+                ts_in,
+                ts_alt,
+            )
 
     # Metadata filters via nested dict
     md = filters.get("metadata")
@@ -435,8 +452,38 @@ class PgVectorPolicyRetriever:
                 out[0].chunk_id,
                 out[0].score,
             )
+
+            # Debug: show top-N hits with the metadata fields that drive narrowing.
+            try:
+                preview = []
+                for c in out[:5]:
+                    md2 = c.metadata or {}
+                    preview.append(
+                        {
+                            "policy_id": c.policy_id,
+                            "chunk_id": c.chunk_id,
+                            "score": round(float(c.score), 6),
+                            "clause_number": md2.get("clause_number"),
+                            "clause_id": md2.get("clause_id"),
+                            "applies_to_all_termsets": md2.get("applies_to_all_termsets"),
+                            "termsets": md2.get("termsets"),
+                        }
+                    )
+                logger.debug("PGVECTOR: top_hits_preview=%s", preview)
+            except Exception:
+                pass
         else:
-            logger.info("PGVECTOR: no hits")
+            # If this is unexpected, enable DEBUG to inspect the computed filter_sql/filter_params above.
+            if filters:
+                logger.warning(
+                    "PGVECTOR: no hits collection=%s top_k=%s min_score=%s filters=%s",
+                    collection,
+                    top_k,
+                    min_score,
+                    (filters or {}),
+                )
+            else:
+                logger.info("PGVECTOR: no hits")
 
         return out
 

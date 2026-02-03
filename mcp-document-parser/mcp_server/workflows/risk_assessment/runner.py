@@ -61,19 +61,46 @@ DEFAULT_RISK_SUMMARY_SYSTEM_PROMPT = (
     "Produce a concise executive summary, key themes, and recommended next steps."
 )
 
+# Clause label normalization
+# Supports labels like:
+# - "2", "2.", "2.1", "2.1."
+# - "SECTION 3", "Section 3.1"
+# - "CLAUSE 4", "Clause 4.2"
 _CLAUSE_NUMBER_RE = re.compile(r"^\s*(\d+(?:\.\d+)*)")
+_SECTION_NUMBER_RE = re.compile(r"^\s*SECTION\s+(\d+(?:\.\d+)*)", re.IGNORECASE)
+_CLAUSE_PREFIX_NUMBER_RE = re.compile(r"^\s*CLAUSE\s+(\d+(?:\.\d+)*)", re.IGNORECASE)
 
 
 def _extract_clause_number(label: Optional[str]) -> Optional[str]:
-    """Extract a canonical clause number from labels like '2', '2.', '2.1', '2.1.'"""
+    """Extract a canonical clause number from common label formats.
+
+    Returns a normalized numeric string (e.g., "3", "3.1").
+    """
     if not label:
         return None
     s = str(label).strip()
     if not s:
         return None
-    s = s.rstrip(".")
-    m = _CLAUSE_NUMBER_RE.match(s)
-    return m.group(1) if m else None
+
+    # Normalize trailing punctuation (e.g., "2.", "SECTION 3:")
+    s2 = s.rstrip(".:")
+
+    # 1) Plain numeric at start
+    m = _CLAUSE_NUMBER_RE.match(s2)
+    if m:
+        return m.group(1)
+
+    # 2) "SECTION <num>"
+    m = _SECTION_NUMBER_RE.match(s2)
+    if m:
+        return m.group(1)
+
+    # 3) "CLAUSE <num>"
+    m = _CLAUSE_PREFIX_NUMBER_RE.match(s2)
+    if m:
+        return m.group(1)
+
+    return None
 
 # Prompt-size guards to reduce truncated/invalid JSON responses.
 MAX_CLAUSE_CHARS = 14000
@@ -563,10 +590,12 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
             citations: List[PolicyCitation] = []
             # Debug: start RAG retrieval for this clause
             logger.info(
-                "RAG: start clause_id=%s label=%s title=%s collection=%s top_k=%s min_score=%s start_filters=%s",
+                "RAG: start clause_id=%s label=%s title=%s clause_text_len=%s clause_text_fp=%s collection=%s top_k=%s min_score=%s start_filters=%s",
                 cid,
                 getattr(clause, "label", None),
                 getattr(clause, "title", None),
+                len(clause_text or ""),
+                _prompt_fingerprint(clause_text or ""),
                 start.policy_collection,
                 start.top_k,
                 start.min_score,
@@ -575,9 +604,22 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
             try:
                 base_filters: Dict[str, Any] = dict(start.filters or {})
 
-                clause_number = _extract_clause_number(getattr(clause, "label", None))
+                # Derive a canonical clause number for deterministic narrowing.
+                # We primarily use the clause label, but fall back to title when needed.
+                clause_number = (
+                    _extract_clause_number(getattr(clause, "label", None))
+                    or _extract_clause_number(getattr(clause, "title", None))
+                )
                 if clause_number:
                     base_filters["clause_number"] = clause_number
+                else:
+                    # If this happens, retrieval will not be clause-narrowed (only termset/caller filters apply).
+                    logger.warning(
+                        "RAG: no clause_number extracted; clause narrowing disabled (clause_id=%s label=%r title=%r)",
+                        cid,
+                        getattr(clause, "label", None),
+                        getattr(clause, "title", None),
+                    )
 
                 # NOTE: pgvector retriever expects the special key "termset" (not "termset_id").
                 termset_id = getattr(start, "termset_id", None)
@@ -585,7 +627,7 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                     base_filters["termset"] = termset_id
 
                 logger.info(
-                    "RAG: primary query clause_id=%s clause_number=%s termset_id=%s filters=%s",
+                    "RAG: primary query clause_id=%s clause_narrow_key=%s termset_id=%s filters=%s",
                     cid,
                     clause_number,
                     termset_id,
