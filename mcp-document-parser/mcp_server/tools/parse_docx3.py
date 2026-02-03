@@ -72,6 +72,12 @@ NUMERIC_RE = re.compile(r"^\s*((?:\d+\.)+\d+|\d+\.?)(?=\s)\s+(.+)$")
 PAREN_ALPHA_RE = re.compile(r"^\s*(\([a-z]\))(?=\s)\s+(.+)$", re.IGNORECASE)
 PAREN_ROMAN_RE = re.compile(r"^\s*(\([ivxlcdm]+\))(?=\s)\s+(.+)$", re.IGNORECASE)
 
+# Reserved clause headings like "{RESERVED}" or "7. {RESERVED}"
+RESERVED_CLAUSE_RE = re.compile(
+    r"^\s*(?:\d+(?:\.\d+)*)?\s*[\.)\-:]?\s*\{?\s*RESERVED\s*\}?\s*$",
+    re.IGNORECASE,
+)
+
 
 TOC_STYLE_RE = re.compile(r"^TOC\d+$", re.IGNORECASE)
 
@@ -1050,6 +1056,7 @@ def _assign_hierarchy(clauses: List[Clause]) -> None:
         stack.append(clause)
 
 
+
 def _mk_header_line(label: Optional[str], title: Optional[str], clean_text: str) -> str:
     ct = (clean_text or "").strip()
     if label and title:
@@ -1060,6 +1067,24 @@ def _mk_header_line(label: Optional[str], title: Optional[str], clean_text: str)
             return ct
         return f"{label} {ct}".strip()
     return ct
+
+
+def _looks_like_all_caps_heading(s: Optional[str]) -> bool:
+    """Heuristic: treat short, mostly-all-caps titles as clause headings.
+
+    This helps distinguish top-level clause headings like "DEFECTIVE WORK" from
+    numbered list items inside a clause.
+    """
+    if not s:
+        return False
+    t = (s or "").strip()
+    if not t or len(t) > 140:
+        return False
+    letters = re.sub(r"[^A-Za-z]+", "", t)
+    if not letters:
+        return False
+    # Require at least a few letters; headings are typically ALL CAPS.
+    return len(letters) >= 4 and letters.isupper()
 
 
 # ======================================================================================
@@ -1105,7 +1130,9 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
             style_outline = _load_style_outline_levels(z)
 
             # Numbering engine (best-effort)
+            # Use a separate instance for the pre-scan so counters don't affect the main parse loop.
             numbering = _NumberingEngine(z)
+            numbering_scan = _NumberingEngine(z)
 
             # Comments map
             comments_map: Dict[str, Comment] = {}
@@ -1154,12 +1181,29 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                 if ol is not None:
                     heading_levels.append(int(ol))
 
-                # Numeric fallback boundaries should only consider paragraphs that are NOT list-numbered.
-                # This avoids splitting subclauses that are implemented as lists (w:numPr).
-                if not _has_numpr(p):
-                    k3, _lbl, _ttl, nd = _detect_label_kind((clean_text or "").strip())
-                    if k3 == "numeric" and nd is not None:
-                        numeric_depths.append(int(nd))
+                # Numeric fallback boundaries:
+                # - Prefer non-list-numbered paragraphs.
+                # - ALSO consider top-level list-numbered headings (ilvl==0) because many contracts
+                #   implement main clause headings as a numbered list.
+                num_label_s, num_ilvl_s = numbering_scan.next_label(p)
+                is_list_item_s = _has_numpr(p)
+                is_top_level_list_s = bool(is_list_item_s and (num_ilvl_s == 0))
+
+                k3, _lbl, _ttl, nd = _detect_label_kind((clean_text or "").strip())
+                if k3 == "numeric" and nd is not None and (not is_list_item_s or is_top_level_list_s):
+                    numeric_depths.append(int(nd))
+                elif (
+                    k3 is None
+                    and num_label_s
+                    and (num_ilvl_s is not None)
+                    and is_top_level_list_s
+                    and (clean_text or "").strip()
+                ):
+                    # Auto-numbered top-level heading where the number isn't present in w:t.
+                    try:
+                        numeric_depths.append(int(_numeric_depth(num_label_s.strip())))
+                    except Exception:
+                        pass
 
             # Primary heading level heuristic:
             # For "one card per main clause", treat the SHALLOWEST outline level observed as the boundary.
@@ -1191,6 +1235,9 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                 deleted_text = "".join(
                     t for t, k, _m in seg3 if k in ("deleted", "moved_from")
                 ).replace("\r", "")
+
+                # Detect reserved clause headings like "7. {RESERVED}" or "{RESERVED}".
+                is_reserved_heading = bool(RESERVED_CLAUSE_RE.match((clean_text or "").strip()))
 
                 comment_ids = _paragraph_comment_ids(p) if input_data.options.extract_comments else []
                 has_signal = bool(clean_text.strip() or deleted_text.strip() or raw_spans or comment_ids)
@@ -1224,6 +1271,15 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                     label = num_label.strip()
                     title = clean_text.strip()
                     num_depth = _numeric_depth(label) if label else None
+
+                # Normalize reserved headings to a consistent title.
+                if is_reserved_heading:
+                    title = "Reserved"
+                    # If this paragraph is auto-numbered and we haven't classified it, treat it as numeric.
+                    if kind is None and num_label and (num_ilvl is not None):
+                        kind = "numeric"
+                        label = num_label.strip()
+                        num_depth = _numeric_depth(label) if label else None
 
                 # For change summaries, we want a best-effort label even for deleted paragraphs.
                 label_guess: Optional[str] = None
@@ -1311,8 +1367,14 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                 #      shallowest observed numeric depth, but DO NOT split on list-numbered paragraphs (w:numPr).
                 is_boundary = False
                 is_list_item = _has_numpr(p)
+                is_top_level_list_number = bool(is_list_item and (num_ilvl == 0))
+                title_is_headingish = _looks_like_all_caps_heading(title) or bool(is_reserved_heading)
 
                 if block_kind not in ("deleted", "moved_from"):
+                    # Reserved clauses should always be split as their own Clause.
+                    if is_reserved_heading:
+                        is_boundary = True
+
                     if primary_heading_level is not None:
                         # Heading-driven mode
                         if outline_level is not None and int(outline_level) == int(primary_heading_level):
@@ -1330,6 +1392,14 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                             and num_depth is not None
                             and int(num_depth) == int(numeric_boundary_depth)
                         ):
+                            is_boundary = True
+                        elif (
+                            kind == "numeric"
+                            and is_top_level_list_number
+                            and title_is_headingish
+                        ):
+                            # Many contracts use w:numPr for main clause headings (7, 8, 9, ...).
+                            # Split on top-level (ilvl==0) list-numbered headings when the title looks like a clause heading.
                             is_boundary = True
 
                 # Clause level:

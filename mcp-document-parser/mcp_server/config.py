@@ -160,6 +160,17 @@ class Settings(BaseSettings):
     # clause_id token (e.g., clause_0004_xxx -> "4"). This helps avoid termset-only fallback.
     rag_use_clause_id_fallback: bool = Field(default=True, alias="RAG_USE_CLAUSE_ID_FALLBACK")
 
+    # When true, skip running RAG/LLM risk assessment for clauses that have no tracked changes/comments.
+    # Skipped clauses will still be included in outputs with status="skipped_no_changes".
+    risk_skip_unchanged_clauses: bool = Field(default=True, alias="RISK_SKIP_UNCHANGED_CLAUSES")
+
+    # When true, treat placeholder "Reserved" clauses as reserved (no RAG/LLM) and include them in outputs
+    # with status="reserved".
+    risk_treat_reserved_clauses_as_reserved: bool = Field(
+        default=True,
+        alias="RISK_TREAT_RESERVED_CLAUSES_AS_RESERVED",
+    )
+
     # -----------------
     # Risk assessment prompts
     # -----------------

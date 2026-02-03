@@ -274,6 +274,15 @@ class ClauseAssessment(BaseModel):
     label: Optional[str] = None
     title: Optional[str] = None
 
+    # Workflow status for this clause assessment.
+    # - assessed: evaluated by the LLM
+    # - skipped_no_changes: skipped because no tracked changes/comments were detected
+    # - reserved: reserved placeholder clause (no substantive text)
+    status: Literal["assessed", "skipped_no_changes", "reserved"] = "assessed"
+
+    # Optional reason/details when a clause is skipped/reserved.
+    skip_reason: Optional[str] = None
+
     risk_score: int = Field(ge=0, le=100)
     risk_level: Literal["low", "medium", "high"]
 
@@ -308,7 +317,6 @@ class ClauseAssessment(BaseModel):
     justification: str
     issues: List[RiskIssue] = Field(default_factory=list)
     citations: List[PolicyCitation] = Field(default_factory=list)
-
 
     recommended_redline: Optional[str] = None
 

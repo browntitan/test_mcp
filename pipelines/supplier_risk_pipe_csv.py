@@ -348,6 +348,9 @@ class Pipeline:
             "clause_id",
             "label",
             "title",
+            "status",
+            "skip_reason",
+            "note",
             "risk_level",
             "risk_score",
             "justification",
@@ -364,6 +367,17 @@ class Pipeline:
             clause_id = str(a.get("clause_id") or "")
             label = str(a.get("label") or "")
             title = str(a.get("title") or "")
+
+            status = str(a.get("status") or "assessed")
+            skip_reason = str(a.get("skip_reason") or "")
+
+            # Friendly, human-readable note for non-assessed clauses.
+            note = ""
+            if status == "skipped_no_changes":
+                note = "Skipped due to no changes"
+            elif status == "reserved":
+                note = "Reserved"
+
             risk_level = str(a.get("risk_level") or "")
 
             risk_score = a.get("risk_score")
@@ -415,6 +429,9 @@ class Pipeline:
                 clause_id,
                 label,
                 title,
+                status,
+                skip_reason,
+                note,
                 risk_level,
                 risk_score,
                 justification,

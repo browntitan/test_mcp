@@ -310,6 +310,79 @@ def _changes_plain_text(clause: Clause) -> str:
     return "\n".join(lines).strip()
 
 
+# ----------------------
+# Clause change/skip helpers
+# ----------------------
+
+def _clause_has_any_changes(clause: Clause) -> bool:
+    """Return True if the clause contains any tracked changes or comments.
+
+    This is used to short-circuit risk assessment work for unchanged clauses.
+    """
+    # Prefer structured changes if present
+    ch = getattr(clause, "changes", None)
+    if ch is not None:
+        try:
+            if (ch.added and len(ch.added) > 0) or (ch.deleted and len(ch.deleted) > 0) or (ch.modified and len(ch.modified) > 0):
+                return True
+            if ch.comments and len(ch.comments) > 0:
+                return True
+        except Exception:
+            pass
+
+    # Fallback: redlines + comments
+    red = getattr(clause, "redlines", None)
+    if red is not None:
+        try:
+            ins = getattr(red, "insertions", None) or []
+            dele = getattr(red, "deletions", None) or []
+            if len(ins) > 0 or len(dele) > 0:
+                return True
+        except Exception:
+            pass
+
+    comms = getattr(clause, "comments", None) or []
+    return len(comms) > 0
+
+
+def _is_reserved_clause(clause: Clause) -> bool:
+    """Return True if this clause is a "Reserved" placeholder clause.
+
+    parse_docx3.py normalizes reserved headings to title == "Reserved".
+    We also defensively check for the token RESERVED in the header/body.
+    """
+    try:
+        if (getattr(clause, "title", None) or "").strip().lower() == "reserved":
+            return True
+    except Exception:
+        pass
+
+    header = f"{getattr(clause, 'label', '') or ''} {getattr(clause, 'title', '') or ''}".strip()
+    body = (getattr(clause, "text", None) or "").strip()
+    blob = (header + "\n" + body).strip()
+    if not blob:
+        return False
+
+    # Match {RESERVED} or RESERVED as a standalone token.
+    return bool(re.search(r"\bRESERVED\b", blob, re.IGNORECASE))
+
+
+def _apply_optional_status_fields(a: ClauseAssessment, *, status: str, skip_reason: str) -> ClauseAssessment:
+    """Apply status fields if the schema supports them (backward compatible)."""
+    fields = getattr(ClauseAssessment, "model_fields", {}) or {}
+    update: Dict[str, Any] = {}
+    if "status" in fields:
+        update["status"] = status
+    if "skip_reason" in fields:
+        update["skip_reason"] = skip_reason
+    if update:
+        try:
+            return a.model_copy(update=update)
+        except Exception:
+            return a
+    return a
+
+
 def _format_clause_for_assessment(clause: Clause, include_changes: bool) -> str:
     header_parts: List[str] = []
     if clause.label:
@@ -572,7 +645,10 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
 
         include_changes = bool(start.include_text_with_changes)
 
-        results: List[ClauseAssessment] = []
+        # Track all clause outputs (including skipped/reserved) so the run can complete successfully.
+        results_all: List[ClauseAssessment] = []
+        # Track only LLM-assessed clauses for totals/summary.
+        results_assessed: List[ClauseAssessment] = []
 
         # Deterministic order: we iterate in clause_order. (Concurrency can be added later.)
         for idx, cid in enumerate(clause_order, start=1):
@@ -610,6 +686,88 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
                     await store.put_clause_text(assessment_id, cid, clause_text_full)  # type: ignore[attr-defined]
             except Exception as e:
                 await store.add_warning(assessment_id, f"Failed to store clause text for clause_id={cid}: {e}")
+
+            # -----------------
+            # Short-circuit paths (no RAG/LLM)
+            # -----------------
+            treat_reserved = bool(getattr(settings, "risk_treat_reserved_clauses_as_reserved", True))
+            skip_unchanged = bool(getattr(settings, "risk_skip_unchanged_clauses", True))
+
+            if treat_reserved and _is_reserved_clause(clause):
+                reserved_assessment = ClauseAssessment(
+                    clause_id=cid,
+                    label=str(clause.label) if clause.label else None,
+                    title=str(clause.title) if clause.title else None,
+                    risk_score=0,
+                    risk_level="low",
+                    justification="Reserved clause (no substantive text to assess).",
+                    issues=[],
+                    citations=[],
+                    recommended_redline=None,
+                )
+                reserved_assessment = _apply_optional_status_fields(
+                    reserved_assessment,
+                    status="reserved",
+                    skip_reason="reserved_clause",
+                )
+
+                logger.info("SKIP: reserved clause_id=%s", cid)
+
+                await store.put_clause_result(assessment_id, reserved_assessment)
+                try:
+                    if hasattr(store, "put_clause_risk_result"):
+                        rr = ClauseRiskResult(
+                            clause_id=cid,
+                            label=reserved_assessment.label,
+                            title=reserved_assessment.title,
+                            text_with_changes=clause_text_full,
+                            assessment=reserved_assessment,
+                        )
+                        await store.put_clause_risk_result(assessment_id, rr)  # type: ignore[attr-defined]
+                except Exception as e:
+                    await store.add_warning(assessment_id, f"Failed to store ClauseRiskResult for reserved clause_id={cid}: {e}")
+
+                results_all.append(reserved_assessment)
+                await store.set_progress(assessment_id, completed_clauses=idx, current_clause_id=cid)
+                continue
+
+            if skip_unchanged and (not _clause_has_any_changes(clause)):
+                skipped_assessment = ClauseAssessment(
+                    clause_id=cid,
+                    label=str(clause.label) if clause.label else None,
+                    title=str(clause.title) if clause.title else None,
+                    risk_score=0,
+                    risk_level="low",
+                    justification="Skipped due to no changes.",
+                    issues=[],
+                    citations=[],
+                    recommended_redline=None,
+                )
+                skipped_assessment = _apply_optional_status_fields(
+                    skipped_assessment,
+                    status="skipped_no_changes",
+                    skip_reason="no_tracked_changes_or_comments",
+                )
+
+                logger.info("SKIP: no changes clause_id=%s", cid)
+
+                await store.put_clause_result(assessment_id, skipped_assessment)
+                try:
+                    if hasattr(store, "put_clause_risk_result"):
+                        rr = ClauseRiskResult(
+                            clause_id=cid,
+                            label=skipped_assessment.label,
+                            title=skipped_assessment.title,
+                            text_with_changes=clause_text_full,
+                            assessment=skipped_assessment,
+                        )
+                        await store.put_clause_risk_result(assessment_id, rr)  # type: ignore[attr-defined]
+                except Exception as e:
+                    await store.add_warning(assessment_id, f"Failed to store ClauseRiskResult for skipped clause_id={cid}: {e}")
+
+                results_all.append(skipped_assessment)
+                await store.set_progress(assessment_id, completed_clauses=idx, current_clause_id=cid)
+                continue
 
             # Retrieve policy context via pgvector.
             # We deterministically narrow guidance by clause_number and (optionally) termset.
@@ -922,7 +1080,8 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
             except Exception as e:
                 await store.add_warning(assessment_id, f"Failed to store ClauseRiskResult for clause_id={cid}: {e}")
 
-            results.append(assessment)
+            results_all.append(assessment)
+            results_assessed.append(assessment)
 
             await store.set_progress(assessment_id, completed_clauses=idx, current_clause_id=cid)
 
@@ -934,24 +1093,30 @@ async def _run_assessment(assessment_id: str, parse_result: DocumentParseResult,
 
         # If we produced no clause results, treat this as a failure rather than a misleading "completed" run.
         # The store warnings will contain the real reason (JSON/schema validation, LLM connectivity, etc.).
-        if not results:
+        if not results_all:
             raise RuntimeError(
                 "All clause assessments failed (no clause results produced). "
                 "Check assessment warnings for JSON parsing/schema validation/LLM failures."
             )
 
         # Totals + summary
+        skipped_count = sum(1 for r in results_all if (getattr(r, "status", None) == "skipped_no_changes"))
+        reserved_count = sum(1 for r in results_all if (getattr(r, "status", None) == "reserved"))
+
         totals: Dict[str, Any] = {
-            "total": len(results),
-            "low": sum(1 for r in results if r.risk_level == "low"),
-            "medium": sum(1 for r in results if r.risk_level == "medium"),
-            "high": sum(1 for r in results if r.risk_level == "high"),
-            "avg_score": (sum(r.risk_score for r in results) / len(results)) if results else 0,
+            "total": len(results_all),
+            "assessed": len(results_assessed),
+            "skipped_no_changes": skipped_count,
+            "reserved": reserved_count,
+            "low": sum(1 for r in results_assessed if r.risk_level == "low"),
+            "medium": sum(1 for r in results_assessed if r.risk_level == "medium"),
+            "high": sum(1 for r in results_assessed if r.risk_level == "high"),
+            "avg_score": (sum(r.risk_score for r in results_assessed) / len(results_assessed)) if results_assessed else 0,
         }
 
         # Prepare a compact summary prompt
-        top_high = sorted([r for r in results if r.risk_level == "high"], key=lambda x: x.risk_score, reverse=True)[:8]
-        top_med = sorted([r for r in results if r.risk_level == "medium"], key=lambda x: x.risk_score, reverse=True)[:6]
+        top_high = sorted([r for r in results_assessed if r.risk_level == "high"], key=lambda x: x.risk_score, reverse=True)[:8]
+        top_med = sorted([r for r in results_assessed if r.risk_level == "medium"], key=lambda x: x.risk_score, reverse=True)[:6]
 
         lines: List[str] = []
         lines.append(f"Document: {parse_result.document.filename}")
