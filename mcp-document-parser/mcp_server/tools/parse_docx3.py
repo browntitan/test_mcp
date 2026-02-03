@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import re
 import tempfile
@@ -57,6 +58,15 @@ NAMESPACES = {
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
 }
 _W = NAMESPACES["w"]
+
+logger = logging.getLogger(__name__)
+
+
+def _preview(s: str, n: int = 120) -> str:
+    s2 = (s or "").replace("\n", " ").replace("\r", " ").strip()
+    if len(s2) <= n:
+        return s2
+    return s2[: n - 1] + "…"
 
 
 def _w(local: str) -> str:
@@ -1161,9 +1171,15 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
             heading_levels: List[int] = []
             numeric_depths: List[int] = []
 
+            scan_total = 0
+            scan_toc_skipped = 0
+            scan_deleted_skipped = 0
+
             for (p, bk, _m) in paragraph_blocks:
+                scan_total += 1
                 toc_state_scan.update_from_paragraph(p)
                 if bk in ("deleted", "moved_from"):
+                    scan_deleted_skipped += 1
                     continue
 
                 # We need clean text to evaluate literal TOC heading and TOC-ish styles
@@ -1174,6 +1190,12 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
 
                 sid = _pstyle_id(p)
                 if _is_toc_paragraph(clean_text, sid, toc_state_scan):
+                    scan_toc_skipped += 1
+                    logger.debug(
+                        "PARSE: pre-scan skip TOC style=%s text=%r",
+                        sid,
+                        _preview(clean_text),
+                    )
                     continue
 
                 # Prefer Word outline levels / heading styles.
@@ -1212,6 +1234,18 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
             # Numeric boundary depth fallback: choose the shallowest numeric depth observed.
             numeric_boundary_depth: Optional[int] = min(numeric_depths) if numeric_depths else None
 
+            logger.info(
+                "PARSE: heuristics termset_id=%s primary_heading_level=%s numeric_boundary_depth=%s paragraphs=%s toc_skipped=%s deleted_skipped=%s heading_levels=%s numeric_depths=%s",
+                termset_id,
+                primary_heading_level,
+                numeric_boundary_depth,
+                scan_total,
+                scan_toc_skipped,
+                scan_deleted_skipped,
+                len(heading_levels),
+                len(numeric_depths),
+            )
+
             clauses: List[Clause] = []
             current_clause: Optional[Clause] = None
 
@@ -1219,6 +1253,11 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
             change_comments_by_clause: Dict[int, Dict[str, ClauseCommentItem]] = defaultdict(dict)
 
             toc_state = _TocState()
+
+            toc_skipped = 0
+            boundary_count = 0
+            reserved_boundary_count = 0
+            append_after_reserved = 0
 
             for p_index, (p, block_kind, block_meta) in enumerate(paragraph_blocks):
                 toc_state.update_from_paragraph(p)
@@ -1250,6 +1289,13 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
 
                 # Skip Table of Contents section entirely
                 if _is_toc_paragraph(clean_text, style_id, toc_state):
+                    toc_skipped += 1
+                    logger.debug(
+                        "PARSE: skip TOC p_index=%s style=%s text=%r",
+                        p_index,
+                        style_id,
+                        _preview(clean_text),
+                    )
                     # still advance numbering state for consistency
                     numbering.next_label(p)
                     continue
@@ -1364,8 +1410,10 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                 #      - However, if a paragraph has NO outline level but clearly matches ARTICLE/SECTION,
                 #        still allow it to start a clause (common in some templates).
                 #   2) If outline levels are missing, fall back to ARTICLE/SECTION or numeric headings at the
-                #      shallowest observed numeric depth, but DO NOT split on list-numbered paragraphs (w:numPr).
+                #      shallowest observed numeric depth. Avoid splitting list-numbered paragraphs except for
+                #      TOP-LEVEL (ilvl==0) clause headings, which many templates implement via w:numPr.
                 is_boundary = False
+                boundary_reason: Optional[str] = None
                 is_list_item = _has_numpr(p)
                 is_top_level_list_number = bool(is_list_item and (num_ilvl == 0))
                 title_is_headingish = _looks_like_all_caps_heading(title) or bool(is_reserved_heading)
@@ -1374,17 +1422,21 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                     # Reserved clauses should always be split as their own Clause.
                     if is_reserved_heading:
                         is_boundary = True
+                        boundary_reason = "reserved"
 
-                    if primary_heading_level is not None:
+                    if not is_boundary and primary_heading_level is not None:
                         # Heading-driven mode
                         if outline_level is not None and int(outline_level) == int(primary_heading_level):
                             is_boundary = True
+                            boundary_reason = "outline_primary"
                         elif outline_level is None and kind in ("article", "section") and not is_list_item:
                             is_boundary = True
-                    else:
+                            boundary_reason = "article_section"
+                    elif not is_boundary:
                         # Fallback mode
                         if kind in ("article", "section") and not is_list_item:
                             is_boundary = True
+                            boundary_reason = "article_section"
                         elif (
                             kind == "numeric"
                             and not is_list_item
@@ -1393,14 +1445,44 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                             and int(num_depth) == int(numeric_boundary_depth)
                         ):
                             is_boundary = True
+                            boundary_reason = "numeric_depth"
+                        elif (
+                            kind == "numeric"
+                            and is_top_level_list_number
+                            and numeric_boundary_depth is not None
+                            and num_depth is not None
+                            and int(num_depth) == int(numeric_boundary_depth)
+                        ):
+                            is_boundary = True
+                            boundary_reason = "top_level_list_depth"
                         elif (
                             kind == "numeric"
                             and is_top_level_list_number
                             and title_is_headingish
                         ):
-                            # Many contracts use w:numPr for main clause headings (7, 8, 9, ...).
-                            # Split on top-level (ilvl==0) list-numbered headings when the title looks like a clause heading.
                             is_boundary = True
+                            boundary_reason = "top_level_list_heuristic"
+
+                if is_boundary:
+                    boundary_count += 1
+                    if is_reserved_heading:
+                        reserved_boundary_count += 1
+                    logger.info(
+                        "PARSE: new_clause p_index=%s reason=%s kind=%s label=%s title=%r outline=%s primary_outline=%s list=%s ilvl=%s num_label=%s num_depth=%s numeric_boundary_depth=%s text=%r",
+                        p_index,
+                        boundary_reason,
+                        kind,
+                        label,
+                        title,
+                        outline_level,
+                        primary_heading_level,
+                        bool(is_list_item),
+                        num_ilvl,
+                        num_label,
+                        num_depth,
+                        numeric_boundary_depth,
+                        _preview(clean_text),
+                    )
 
                 # Clause level:
                 # Since we intentionally group subclauses into the parent clause, all emitted clauses are level 1.
@@ -1447,6 +1529,23 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                         )
                     else:
                         if clean_text.strip():
+                            # Warn if we are appending substantive content to a Reserved clause.
+                            try:
+                                if (current_clause.title or "").strip().lower() == "reserved":
+                                    append_after_reserved += 1
+                                    logger.warning(
+                                        "PARSE: append_after_reserved p_index=%s current_label=%s current_title=%r incoming=%r num_label=%s ilvl=%s kind=%s",
+                                        p_index,
+                                        current_clause.label,
+                                        current_clause.title,
+                                        _preview(clean_text),
+                                        num_label,
+                                        num_ilvl,
+                                        kind,
+                                    )
+                            except Exception:
+                                pass
+
                             current_clause.text = (current_clause.text + "\n" + clean_text.strip()).strip()
                         if input_data.options.include_raw_spans:
                             current_clause.raw_spans.extend(raw_spans)
@@ -1521,6 +1620,26 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
             # (Not strictly necessary, but useful when debugging doc formats)
             if toc_state.is_toc or toc_state.active:
                 warnings.append("Detected TOC field/styles; TOC content was skipped during parsing.")
+
+            reserved_total = sum(1 for c in clauses if (c.title or "").strip().lower() == "reserved")
+            logger.info(
+                "PARSE: done clauses=%s reserved=%s toc_skipped=%s boundaries=%s reserved_boundaries=%s append_after_reserved=%s",
+                len(clauses),
+                reserved_total,
+                toc_skipped,
+                boundary_count,
+                reserved_boundary_count,
+                append_after_reserved,
+            )
+
+            # Debug: print a short header list to help spot merges/missing boundaries.
+            try:
+                hdrs = []
+                for c in clauses[:12]:
+                    hdrs.append(_preview(f"{c.label or ''} {c.title or ''}".strip(), 80))
+                logger.debug("PARSE: first_clause_headers=%s", hdrs)
+            except Exception:
+                pass
 
             return DocumentParseResult(document=meta, clauses=clauses, warnings=warnings)
 
