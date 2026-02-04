@@ -9,7 +9,7 @@ import tempfile
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from lxml import etree
 
@@ -769,6 +769,269 @@ def _load_style_outline_levels(z: zipfile.ZipFile) -> Dict[str, int]:
     return out
 
 
+# -----------------------------
+# Bold heading heuristics (for List Paragraph headings)
+# -----------------------------
+
+def _p_num_id_ilvl(p: etree._Element) -> Tuple[Optional[str], Optional[int]]:
+    """Return (numId, ilvl) from w:numPr without advancing any counters."""
+    numPr = p.find("w:pPr/w:numPr", namespaces=NAMESPACES)
+    if numPr is None:
+        return None, None
+    ilvl_el = numPr.find("w:ilvl", namespaces=NAMESPACES)
+    numId_el = numPr.find("w:numId", namespaces=NAMESPACES)
+    if ilvl_el is None or numId_el is None:
+        return None, None
+
+    num_id: Optional[str] = None
+    ilvl: Optional[int] = None
+
+    v1 = numId_el.get(_w("val")) or numId_el.get("val")
+    v2 = ilvl_el.get(_w("val")) or ilvl_el.get("val")
+    if v1 is not None:
+        num_id = str(v1).strip() or None
+    if v2 is not None:
+        try:
+            ilvl = int(str(v2).strip())
+        except Exception:
+            ilvl = None
+
+    return num_id, ilvl
+
+
+def _bool_from_w_val(v: Optional[str]) -> Optional[bool]:
+    if v is None:
+        return None
+    vv = str(v).strip().lower()
+    if vv in ("0", "false", "off", "none"):
+        return False
+    if vv in ("1", "true", "on"):
+        return True
+    # Unknown token; treat as present/true.
+    return True
+
+
+def _style_explicit_bold(style_el: etree._Element) -> Optional[bool]:
+    """Return explicit bold setting from a style's rPr if present, else None."""
+    rpr = style_el.find("w:rPr", namespaces=NAMESPACES)
+    if rpr is None:
+        return None
+
+    b = rpr.find("w:b", namespaces=NAMESPACES)
+    bcs = rpr.find("w:bCs", namespaces=NAMESPACES)
+
+    if b is not None:
+        v = b.get(_w("val")) or b.get("val")
+        return _bool_from_w_val(v) if v is not None else True
+
+    if bcs is not None:
+        v = bcs.get(_w("val")) or bcs.get("val")
+        return _bool_from_w_val(v) if v is not None else True
+
+    return None
+
+
+def _load_style_bold_defaults(z: zipfile.ZipFile) -> Dict[str, bool]:
+    """Resolve paragraph styleId -> default bold (best-effort).
+
+    Word often applies bold via the paragraph style (e.g., Heading 1) without emitting
+    w:rPr/w:b on each run in document.xml. This map lets us treat runs as bold when
+    they inherit a bold default from the paragraph style.
+    """
+    try:
+        styles_xml = z.read("word/styles.xml")
+    except KeyError:
+        return {}
+
+    try:
+        root = etree.fromstring(styles_xml)
+    except Exception:
+        return {}
+
+    based_on: Dict[str, Optional[str]] = {}
+    explicit: Dict[str, Optional[bool]] = {}
+
+    for style in root.findall(".//w:style", namespaces=NAMESPACES):
+        style_id = style.get(_w("styleId")) or style.get("styleId")
+        if not style_id:
+            continue
+
+        st_type = style.get(_w("type")) or style.get("type")
+        if st_type and str(st_type).strip().lower() != "paragraph":
+            continue
+
+        bo = style.find("w:basedOn", namespaces=NAMESPACES)
+        bo_id = (bo.get(_w("val")) or bo.get("val")) if bo is not None else None
+        based_on[str(style_id)] = (str(bo_id).strip() if bo_id else None)
+
+        explicit[str(style_id)] = _style_explicit_bold(style)
+
+    resolved: Dict[str, bool] = {}
+    visiting: Set[str] = set()
+
+    def resolve(sid: str) -> bool:
+        if sid in resolved:
+            return resolved[sid]
+        if sid in visiting:
+            # cycle
+            return False
+        visiting.add(sid)
+
+        ex = explicit.get(sid)
+        if ex is not None:
+            resolved[sid] = bool(ex)
+            visiting.remove(sid)
+            return resolved[sid]
+
+        parent = based_on.get(sid)
+        if parent:
+            resolved[sid] = resolve(parent)
+        else:
+            resolved[sid] = False
+
+        visiting.remove(sid)
+        return resolved[sid]
+
+    for sid in list(explicit.keys()):
+        try:
+            resolve(sid)
+        except Exception:
+            resolved[sid] = False
+
+    return resolved
+
+
+def _run_explicit_bold(r: etree._Element) -> Optional[bool]:
+    """Return explicit bold from a run's rPr if present, else None."""
+    rpr = r.find("w:rPr", namespaces=NAMESPACES)
+    if rpr is None:
+        return None
+
+    b = rpr.find("w:b", namespaces=NAMESPACES)
+    bcs = rpr.find("w:bCs", namespaces=NAMESPACES)
+
+    if b is not None:
+        v = b.get(_w("val")) or b.get("val")
+        return _bool_from_w_val(v) if v is not None else True
+
+    if bcs is not None:
+        v = bcs.get(_w("val")) or bcs.get("val")
+        return _bool_from_w_val(v) if v is not None else True
+
+    return None
+
+
+def _paragraph_bold_stats(p: etree._Element, style_bold_default: bool, prefix_sig_chars: int = 40) -> Dict[str, Any]:
+    """Compute bold coverage statistics for visible text within a paragraph.
+
+    - Counts only visible text (normal/inserted/moved_to), ignores deleted/moved_from.
+    - Uses explicit run bold when present; otherwise falls back to paragraph style default.
+    - Uses *significant* characters (letters/digits) for ratios; falls back to non-space if none.
+    """
+
+    total_sig = 0
+    bold_sig = 0
+
+    prefix_total = 0
+    prefix_bold = 0
+
+    total_fallback = 0
+    bold_fallback = 0
+
+    def add_text(run_text: str, is_bold: bool) -> None:
+        nonlocal total_sig, bold_sig, prefix_total, prefix_bold, total_fallback, bold_fallback
+        for ch in run_text:
+            if ch.isspace():
+                continue
+            # Fallback counts all non-space chars
+            total_fallback += 1
+            if is_bold:
+                bold_fallback += 1
+
+            # Significant counts letters/digits
+            if ch.isalnum():
+                total_sig += 1
+                if is_bold:
+                    bold_sig += 1
+                if prefix_total < prefix_sig_chars:
+                    prefix_total += 1
+                    if is_bold:
+                        prefix_bold += 1
+
+    def walk(node: etree._Element) -> None:
+        # Skip deleted/moved-from content
+        if node.tag in (_w("del"), _w("moveFrom")):
+            return
+
+        # Traverse inserted/moved-to as visible
+        if node.tag in (_w("ins"), _w("moveTo")):
+            for ch in node:
+                walk(ch)
+            return
+
+        if node.tag == _w("r"):
+            ex = _run_explicit_bold(node)
+            is_bold = style_bold_default if ex is None else bool(ex)
+            parts: List[str] = []
+            for ch in node:
+                if ch.tag == _w("t") and ch.text:
+                    parts.append(ch.text)
+                elif ch.tag == _w("tab"):
+                    parts.append("\t")
+                elif ch.tag == _w("br"):
+                    parts.append("\n")
+            if parts:
+                add_text("".join(parts), is_bold)
+            return
+
+        for ch in node:
+            walk(ch)
+
+    walk(p)
+
+    # Prefer significant ratios; fall back to non-space if no significant chars.
+    denom = total_sig if total_sig > 0 else total_fallback
+    num = bold_sig if total_sig > 0 else bold_fallback
+    ratio = (float(num) / float(denom)) if denom > 0 else 0.0
+
+    prefix_ratio = (float(prefix_bold) / float(prefix_total)) if prefix_total > 0 else 0.0
+
+    return {
+        "ratio": ratio,
+        "prefix_ratio": prefix_ratio,
+        "total_sig": total_sig,
+        "bold_sig": bold_sig,
+        "total_chars": total_fallback,
+    }
+
+
+def _is_bold_heading_candidate(p: etree._Element, style_bold_default: bool, clean_text: str) -> Tuple[bool, float, float]:
+    """Decide whether a paragraph looks like a main clause heading based on bold coverage.
+
+    We intentionally require "mostly bold" (not just "contains bold") and a heading-like length.
+    """
+    txt = (clean_text or "").strip()
+    if not txt:
+        return False, 0.0, 0.0
+
+    # heading-shape constraints
+    # (keep conservative to avoid promoting subclauses that have a bold defined term)
+    min_chars = 6
+    max_chars = 180
+    if len(txt) < min_chars or len(txt) > max_chars:
+        return False, 0.0, 0.0
+
+    stats = _paragraph_bold_stats(p, style_bold_default, prefix_sig_chars=40)
+    ratio = float(stats.get("ratio") or 0.0)
+    prefix_ratio = float(stats.get("prefix_ratio") or 0.0)
+
+    # Thresholds chosen to be strict:
+    # - Most top-level headings are entirely bold.
+    # - Subclauses may have some bold, but usually not 85%+ of the paragraph.
+    is_candidate = (ratio >= 0.85) or (prefix_ratio >= 0.95)
+    return bool(is_candidate), ratio, prefix_ratio
+
+
 def _paragraph_outline_level(p: etree._Element, style_outline: Dict[str, int]) -> Optional[int]:
     direct = _p_outline_lvl_direct(p)
     if direct is not None:
@@ -1139,6 +1402,10 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
             # Styles outline map (best-effort)
             style_outline = _load_style_outline_levels(z)
 
+            # Style-based bold defaults (best-effort). Used to detect bold headings even when
+            # w:rPr/w:b is not explicitly present on each run.
+            style_bold = _load_style_bold_defaults(z)
+
             # Numbering engine (best-effort)
             # Use a separate instance for the pre-scan so counters don't affect the main parse loop.
             numbering = _NumberingEngine(z)
@@ -1171,6 +1438,8 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
             heading_levels: List[int] = []
             numeric_depths: List[int] = []
 
+            main_num_ids_count: Dict[str, int] = defaultdict(int)
+
             scan_total = 0
             scan_toc_skipped = 0
             scan_deleted_skipped = 0
@@ -1197,6 +1466,18 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                         _preview(clean_text),
                     )
                     continue
+
+                is_reserved_scan = bool(RESERVED_CLAUSE_RE.match((clean_text or "").strip()))
+
+                num_id_s, ilvl_s = _p_num_id_ilvl(p)
+                style_bold_default_s = bool(style_bold.get(sid or "", False))
+                bold_head_s, _br_s, _bpr_s = _is_bold_heading_candidate(p, style_bold_default_s, clean_text)
+
+                # Record potential main-clause numbering sequences:
+                # - Reserved headings are definitive.
+                # - Bold, short, top-level list-numbered headings are strong signals.
+                if num_id_s and ilvl_s == 0 and (is_reserved_scan or bold_head_s or (sid and sid.lower().startswith("heading"))):
+                    main_num_ids_count[num_id_s] += 1
 
                 # Prefer Word outline levels / heading styles.
                 ol = _paragraph_outline_level(p, style_outline)
@@ -1233,6 +1514,12 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
 
             # Numeric boundary depth fallback: choose the shallowest numeric depth observed.
             numeric_boundary_depth: Optional[int] = min(numeric_depths) if numeric_depths else None
+
+            main_num_ids: Set[str] = set(main_num_ids_count.keys())
+            if main_num_ids:
+                logger.info("PARSE: main_num_ids inferred=%s", sorted(list(main_num_ids))[:12])
+            else:
+                logger.info("PARSE: main_num_ids inferred=empty")
 
             logger.info(
                 "PARSE: heuristics termset_id=%s primary_heading_level=%s numeric_boundary_depth=%s paragraphs=%s toc_skipped=%s deleted_skipped=%s heading_levels=%s numeric_depths=%s",
@@ -1286,6 +1573,11 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                     continue
 
                 style_id = _pstyle_id(p)
+
+                num_id, _ilvl_raw = _p_num_id_ilvl(p)
+                style_bold_default = bool(style_bold.get(style_id or "", False))
+                bold_heading, bold_ratio, bold_prefix_ratio = _is_bold_heading_candidate(p, style_bold_default, clean_text)
+                allow_num_id = (not main_num_ids) or (num_id is not None and num_id in main_num_ids)
 
                 # Skip Table of Contents section entirely
                 if _is_toc_paragraph(clean_text, style_id, toc_state):
@@ -1416,7 +1708,7 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                 boundary_reason: Optional[str] = None
                 is_list_item = _has_numpr(p)
                 is_top_level_list_number = bool(is_list_item and (num_ilvl == 0))
-                title_is_headingish = _looks_like_all_caps_heading(title) or bool(is_reserved_heading)
+                title_is_headingish = _looks_like_all_caps_heading(title) or bool(is_reserved_heading) or bool(bold_heading)
 
                 if block_kind not in ("deleted", "moved_from"):
                     # Reserved clauses should always be split as their own Clause.
@@ -1432,6 +1724,16 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                         elif outline_level is None and kind in ("article", "section") and not is_list_item:
                             is_boundary = True
                             boundary_reason = "article_section"
+                        elif (
+                            outline_level is None
+                            and kind == "numeric"
+                            and is_top_level_list_number
+                            and allow_num_id
+                            and bold_heading
+                            and (numeric_boundary_depth is None or (num_depth is not None and int(num_depth) == int(numeric_boundary_depth)))
+                        ):
+                            is_boundary = True
+                            boundary_reason = "top_level_list_bold"
                     elif not is_boundary:
                         # Fallback mode
                         if kind in ("article", "section") and not is_list_item:
@@ -1439,27 +1741,32 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                             boundary_reason = "article_section"
                         elif (
                             kind == "numeric"
-                            and not is_list_item
-                            and numeric_boundary_depth is not None
-                            and num_depth is not None
-                            and int(num_depth) == int(numeric_boundary_depth)
-                        ):
-                            is_boundary = True
-                            boundary_reason = "numeric_depth"
-                        elif (
-                            kind == "numeric"
                             and is_top_level_list_number
+                            and allow_num_id
                             and numeric_boundary_depth is not None
                             and num_depth is not None
                             and int(num_depth) == int(numeric_boundary_depth)
+                            and (bold_heading or _looks_like_all_caps_heading(title) or bool(is_reserved_heading))
                         ):
+                            # Depth-based split for top-level list-numbered clause headings.
                             is_boundary = True
                             boundary_reason = "top_level_list_depth"
                         elif (
                             kind == "numeric"
                             and is_top_level_list_number
-                            and title_is_headingish
+                            and allow_num_id
+                            and bold_heading
                         ):
+                            # Bold-based fallback when depth inference is missing or when headings are Title Case.
+                            is_boundary = True
+                            boundary_reason = "top_level_list_bold"
+                        elif (
+                            kind == "numeric"
+                            and is_top_level_list_number
+                            and allow_num_id
+                            and _looks_like_all_caps_heading(title)
+                        ):
+                            # Heuristic fallback when depth inference is not available.
                             is_boundary = True
                             boundary_reason = "top_level_list_heuristic"
 
@@ -1468,7 +1775,7 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                     if is_reserved_heading:
                         reserved_boundary_count += 1
                     logger.info(
-                        "PARSE: new_clause p_index=%s reason=%s kind=%s label=%s title=%r outline=%s primary_outline=%s list=%s ilvl=%s num_label=%s num_depth=%s numeric_boundary_depth=%s text=%r",
+                        "PARSE: new_clause p_index=%s reason=%s kind=%s label=%s title=%r outline=%s primary_outline=%s list=%s ilvl=%s num_id=%s num_label=%s num_depth=%s numeric_boundary_depth=%s bold_ratio=%.3f bold_prefix_ratio=%.3f text=%r",
                         p_index,
                         boundary_reason,
                         kind,
@@ -1478,9 +1785,12 @@ def parse_docx(input_data: ParseDocxInput) -> DocumentParseResult:
                         primary_heading_level,
                         bool(is_list_item),
                         num_ilvl,
+                        num_id,
                         num_label,
                         num_depth,
                         numeric_boundary_depth,
+                        float(bold_ratio or 0.0),
+                        float(bold_prefix_ratio or 0.0),
                         _preview(clean_text),
                     )
 
