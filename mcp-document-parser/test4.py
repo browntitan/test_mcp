@@ -102,6 +102,7 @@ class ChatSchema:
     user_col: str
     ts_col: str
     ts_data_type: str  # info_schema data_type (e.g., bigint, timestamp with time zone, etc.)
+    updated_col: str
 
 
 def get_columns(conn, schema: str, table: str) -> Dict[str, str]:
@@ -174,8 +175,23 @@ def detect_schema(conn, schema: str, table: str,
     user_col = pick_user_col()
     ts_col = pick_ts_col()
     ts_data_type = cols[ts_col]
-    logging.info("Using user column: %s | timestamp column: %s (%s)", user_col, ts_col, ts_data_type)
-    return ChatSchema(schema=schema, table=table, user_col=user_col, ts_col=ts_col, ts_data_type=ts_data_type)
+
+    # Prefer updated_at for activity end time (OpenWebUI commonly has it as BIGINT epoch).
+    updated_col = "updated_at" if "updated_at" in cols else ts_col
+
+    logging.info(
+        "Using user column: %s | created timestamp column: %s (%s) | updated timestamp column: %s",
+        user_col, ts_col, ts_data_type, updated_col
+    )
+
+    return ChatSchema(
+        schema=schema,
+        table=table,
+        user_col=user_col,
+        ts_col=ts_col,
+        ts_data_type=ts_data_type,
+        updated_col=updated_col,
+    )
 
 
 # ----------------------------
@@ -308,29 +324,53 @@ def count_rows(conn, chat: ChatSchema, plan: TimeColumnPlan, start: datetime, en
         return int(cur.fetchone()[0])
 
 
-def stream_events(conn, chat: ChatSchema, plan: TimeColumnPlan, start: datetime, end: datetime,
-                  dow_list_pg: List[int], itersize: int = 5000):
+
+def stream_chat_intervals(
+    conn,
+    chat: ChatSchema,
+    plan: TimeColumnPlan,
+    start: datetime,
+    end: datetime,
+    dow_list_pg: List[int],
+    itersize: int = 5000,
+):
+    """Stream chat activity blocks per user as (user_id, start_ts, end_ts).
+
+    We interpret each chat row as an activity interval:
+      start_ts = to_timestamp(created_at)
+      end_ts   = to_timestamp(updated_at)
+
+    Sessions are later built by merging consecutive/overlapping intervals within a gap threshold.
     """
-    Streams (user_id, ts) ordered by (user_id, ts_raw/ts_col).
-    If ts_col is BIGINT, ordering by ts_col is correct chronologically.
-    """
+
+    # Build a timestamp expression for updated_at with the same epoch-unit conversion as created_at.
+    updated_ts_expr = plan.ts_expr.replace(chat.ts_col, chat.updated_col)
+
     q = f"""
     SELECT {chat.user_col} AS user_id,
-           {plan.ts_expr} AS ts
+           {plan.ts_expr} AS start_ts,
+           {updated_ts_expr} AS end_ts
     FROM {chat.schema}.{chat.table}
     WHERE {plan.range_where}
       AND {chat.user_col} IS NOT NULL
+      AND {chat.updated_col} IS NOT NULL
       AND EXTRACT(DOW FROM {plan.ts_expr}) = ANY(%s::int[])
     ORDER BY {chat.user_col}, {chat.ts_col};
     """
+
     params = plan.range_params_builder(start, end) + (dow_list_pg,)
 
-    cur = conn.cursor(name=f"evt_cursor_{int(datetime.now().timestamp())}")
+    cur = conn.cursor(name=f"interval_cursor_{int(datetime.now().timestamp())}")
     cur.itersize = itersize
     cur.execute(q, params)
     try:
-        for user_id, ts in cur:
-            yield user_id, ensure_utc(ts)
+        for user_id, start_ts, end_ts in cur:
+            s = ensure_utc(start_ts)
+            e = ensure_utc(end_ts)
+            # Guard against bad/unchanged values
+            if e < s:
+                e = s
+            yield user_id, s, e
     finally:
         cur.close()
 
@@ -357,14 +397,14 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
 
     current_user = None
     session_start: Optional[datetime] = None
-    last_ts: Optional[datetime] = None
+    session_end: Optional[datetime] = None
     per_week: Dict[date, WeekAgg] = {}
 
     def close_session():
-        nonlocal session_start, last_ts, per_week
-        if session_start is None or last_ts is None:
+        nonlocal session_start, session_end, per_week
+        if session_start is None or session_end is None:
             return
-        dur_min = max(0.0, (last_ts - session_start).total_seconds() / 60.0)
+        dur_min = max(0.0, (session_end - session_start).total_seconds() / 60.0)
         wk = monday_of(session_start)
         wd = session_start.weekday()  # 0=Mon..6=Sun
         agg = per_week.get(wk)
@@ -376,7 +416,7 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
         agg.days_used.add(wd)
         agg.durations.append(dur_min)
         session_start = None
-        last_ts = None
+        session_end = None
 
     def finalize_user(user_id):
         nonlocal per_week, active_users, active_user_week_rows, durations_active, sessions_per_active_week
@@ -401,29 +441,32 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
 
     pbar = tqdm(total=total_rows, desc=f"[{label}] streaming events", unit="rows")
 
-    for user_id, ts in stream_events(conn, chat, plan, start, end, dow_list_pg, itersize=itersize):
+    for user_id, start_ts, end_ts in stream_chat_intervals(conn, chat, plan, start, end, dow_list_pg, itersize=itersize):
         pbar.update(1)
 
         if current_user is None:
             current_user = user_id
-            session_start = ts
-            last_ts = ts
+            session_start = start_ts
+            session_end = end_ts
             continue
 
         if user_id != current_user:
             close_session()
             finalize_user(current_user)
             current_user = user_id
-            session_start = ts
-            last_ts = ts
+            session_start = start_ts
+            session_end = end_ts
             continue
 
-        if last_ts is not None and (ts - last_ts) <= gap:
-            last_ts = ts
+        # Same user: merge intervals into a session if the gap from current session end is within threshold.
+        if session_end is not None and (start_ts - session_end) <= gap:
+            # Extend session end if this interval ends later.
+            if end_ts > session_end:
+                session_end = end_ts
         else:
             close_session()
-            session_start = ts
-            last_ts = ts
+            session_start = start_ts
+            session_end = end_ts
 
     close_session()
     if current_user is not None:
@@ -584,6 +627,7 @@ def save_combined_histograms(range_label: str, results_by_gap: Dict[int, "RangeR
     plt.savefig(str(out), dpi=160, bbox_inches="tight")
     logging.info("[%s] Wrote %s", range_label, out)
     plt.close()
+
 def write_combined_summaries_csv(rows: List[dict], out_dir: Path) -> Path:
     """Write a combined CSV containing all summary rows (all ranges and all gaps)."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -785,12 +829,11 @@ def main():
         else:
             logging.warning("No October data found (checked preferred/current/previous year). Skipping October analysis.")
 
-        out_dir = Path("stats output")
-        plots_dir = Path("charts output")
+        out_dir = Path("hist_output_data")
+        plots_dir = out_dir
         combined_summary_rows: List[dict] = []
 
-        logging.info("Stats output directory: %s", out_dir.resolve())
-        logging.info("Charts output directory: %s", plots_dir.resolve())
+        logging.info("Output directory (all files): %s", out_dir.resolve())
 
         for range_label, start, end in ranges:
             logging.info("---- Running analysis range: %s ----", range_label)
