@@ -76,11 +76,18 @@ def connect() -> psycopg2.extensions.connection:
         kwargs["host"], kwargs["port"], kwargs["dbname"], kwargs["sslmode"], kwargs["user"]
     )
     conn = psycopg2.connect(**kwargs)
-    conn.autocommit = True
+
+    # IMPORTANT: named (server-side) cursors require an open transaction.
+    # autocommit=True disables transactions and breaks streaming.
+    conn.autocommit = False
+
     with conn.cursor() as cur:
         # Make weekday extraction stable
         cur.execute("SET TIME ZONE 'UTC';")
         cur.execute("SET statement_timeout = '0';")
+
+    # Commit session settings to start with a clean transaction state.
+    conn.commit()
     return conn
 
 
@@ -513,6 +520,63 @@ def save_histograms(label: str, durations: List[float], sessions_per_week: List[
         logging.info("[%s] Wrote %s", label, out)
 
 
+# Overlay histograms for multiple gap settings (e.g., 5m/10m/20m) for a single time range.
+def save_combined_histograms(range_label: str, results_by_gap: Dict[int, "RangeResults"]) -> None:
+    """Create overlay histograms for multiple gap settings (e.g., 5m/10m/20m) for a single time range."""
+    # Session duration overlay
+    cap_minutes = 200
+    bins_dur = np.arange(0, cap_minutes + 5, 5)
+
+    plt.figure()
+    any_data = False
+    for gap in sorted(results_by_gap.keys()):
+        res = results_by_gap[gap]
+        if not res.session_durations_active:
+            continue
+        d = np.array(res.session_durations_active, dtype=float)
+        d_cap = np.clip(d, 0, cap_minutes)
+        # Use step hist so multiple series remain readable.
+        plt.hist(d_cap, bins=bins_dur, histtype="step", label=f"{gap}m")
+        any_data = True
+
+    if any_data:
+        plt.title(f"Session Duration (minutes) — {range_label} (Active User-Weeks)")
+        plt.xlabel(f"Session duration (minutes, capped at {cap_minutes})")
+        plt.ylabel("Count")
+        plt.xlim(0, cap_minutes)
+        plt.legend(title="Session gap")
+        out = f"{range_label.replace(' ', '_').lower()}_session_duration_hist_all_gaps.png"
+        plt.savefig(out, dpi=160, bbox_inches="tight")
+        logging.info("[%s] Wrote %s", range_label, out)
+    plt.close()
+
+    # Sessions-per-week overlay
+    cap_x = 200
+    bins_spw = np.arange(0, cap_x + 2, 1)
+
+    plt.figure()
+    any_data = False
+    for gap in sorted(results_by_gap.keys()):
+        res = results_by_gap[gap]
+        if not res.sessions_per_active_week:
+            continue
+        spw = np.array(res.sessions_per_active_week, dtype=int)
+        spw_cap = np.clip(spw, 0, cap_x)
+        plt.hist(spw_cap, bins=bins_spw, histtype="step", label=f"{gap}m")
+        any_data = True
+
+    if any_data:
+        plt.title(f"Sessions per Week — {range_label} (Active User-Weeks)")
+        plt.xlabel(f"Sessions in week (capped at {cap_x})")
+        plt.ylabel("Count")
+        plt.xlim(0, cap_x)
+        plt.legend(title="Session gap")
+        out = f"{range_label.replace(' ', '_').lower()}_sessions_per_week_hist_all_gaps.png"
+        plt.savefig(out, dpi=160, bbox_inches="tight")
+        logging.info("[%s] Wrote %s", range_label, out)
+    plt.close()
+
+
 def write_excel(results, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     xlsx_path = out_dir / f"{results.label.replace(' ', '_').lower()}_openwebui_stats.xlsx"
@@ -626,7 +690,10 @@ def main():
     ap.add_argument("--prefer-ts", default="created_at", help="Prefer this ts column name when auto-detecting (default created_at).")
     ap.add_argument("--ts-unit", default="auto", choices=["auto", "seconds", "milliseconds"],
                     help="If ts_col is BIGINT/INTEGER: epoch unit. Default auto.")
-    ap.add_argument("--gap-minutes", type=int, default=10, help="Session gap threshold (minutes). Default: 10.")
+    ap.add_argument("--gap-minutes", type=int, default=None,
+                    help="(Legacy) Single session gap threshold in minutes. If set, overrides --gap-values.")
+    ap.add_argument("--gap-values", default="5,10,20",
+                    help="Comma-separated session gap thresholds to evaluate (minutes). Default: 5,10,20")
     ap.add_argument("--required-weekdays", default="0,1,2,3",
                     help="Required weekdays (Python: 0=Mon..6=Sun) for 'active' week. Default Mon-Thu: 0,1,2,3")
     ap.add_argument("--itersize", type=int, default=5000, help="Server-side cursor fetch size (default: 5000).")
@@ -647,6 +714,14 @@ def main():
     required_weekdays = set(int(x.strip()) for x in args.required_weekdays.split(",") if x.strip() != "")
     if not required_weekdays:
         raise ValueError("required_weekdays cannot be empty")
+
+    if args.gap_minutes is not None:
+        gap_values = [int(args.gap_minutes)]
+    else:
+        gap_values = [int(x.strip()) for x in args.gap_values.split(",") if x.strip() != ""]
+
+    if not gap_values:
+        raise ValueError("No gap values provided. Use --gap-values like 5,10,20")
 
     conn = connect()
     try:
@@ -675,26 +750,49 @@ def main():
 
         out_dir = Path("stats output")
 
-        for label, start, end in ranges:
-            logging.info("---- Running analysis: %s ----", label)
-            results = analyze_range(
-                conn=conn,
-                chat=chat,
-                plan=plan,
-                label=label,
-                start=start,
-                end=end,
-                gap_minutes=args.gap_minutes,
-                required_weekdays=required_weekdays,
-                itersize=args.itersize,
-            )
-            print_terminal_summary(results)
-            save_histograms(label, results.session_durations_active, results.sessions_per_active_week)
-            write_excel(results, out_dir)
-            write_summary_csv(results, out_dir)
+        for range_label, start, end in ranges:
+            logging.info("---- Running analysis range: %s ----", range_label)
+
+            results_by_gap: Dict[int, RangeResults] = {}
+
+            for gap in gap_values:
+                label = f"{range_label}_gap{gap}m"
+                logging.info("---- Session gap: %sm (%s) ----", gap, range_label)
+
+                results = analyze_range(
+                    conn=conn,
+                    chat=chat,
+                    plan=plan,
+                    label=label,
+                    start=start,
+                    end=end,
+                    gap_minutes=gap,
+                    required_weekdays=required_weekdays,
+                    itersize=args.itersize,
+                )
+                results_by_gap[gap] = results
+
+                print_terminal_summary(results)
+
+                # Individual plots per gap
+                save_histograms(label, results.session_durations_active, results.sessions_per_active_week)
+
+                # Per-gap outputs (unique filenames because label includes gap)
+                write_excel(results, out_dir)
+                write_summary_csv(results, out_dir)
+
+                # Close the transaction used by the server-side cursor and release resources.
+                conn.commit()
+
+            # Combined overlay plots for this time range
+            save_combined_histograms(range_label, results_by_gap)
 
         logging.info("Done.")
     finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         conn.close()
 
 
