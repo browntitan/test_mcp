@@ -476,7 +476,8 @@ def summarize(label: str, durations: List[float], sessions_per_week: List[int], 
     }
 
 
-def save_histograms(label: str, durations: List[float], sessions_per_week: List[int]) -> None:
+def save_histograms(plots_dir: Path, label: str, durations: List[float], sessions_per_week: List[int]) -> None:
+    plots_dir.mkdir(parents=True, exist_ok=True)
     if durations:
         d = np.array(durations, dtype=float)
 
@@ -493,8 +494,8 @@ def save_histograms(label: str, durations: List[float], sessions_per_week: List[
         plt.xlabel(f"Session duration (minutes, capped at {cap_minutes})")
         plt.ylabel("Count")
         plt.xlim(0, cap_minutes)
-        out = f"{label.replace(' ', '_').lower()}_session_duration_hist.png"
-        plt.savefig(out, dpi=160, bbox_inches="tight")
+        out = plots_dir / f"{label.replace(' ', '_').lower()}_session_duration_hist.png"
+        plt.savefig(str(out), dpi=160, bbox_inches="tight")
         plt.close()
         logging.info("[%s] Wrote %s", label, out)
 
@@ -514,15 +515,16 @@ def save_histograms(label: str, durations: List[float], sessions_per_week: List[
         plt.xlabel(f"Sessions in week (capped at {cap_x})")
         plt.ylabel("Count")
         plt.xlim(0, cap_x)
-        out = f"{label.replace(' ', '_').lower()}_sessions_per_week_hist.png"
-        plt.savefig(out, dpi=160, bbox_inches="tight")
+        out = plots_dir / f"{label.replace(' ', '_').lower()}_sessions_per_week_hist.png"
+        plt.savefig(str(out), dpi=160, bbox_inches="tight")
         plt.close()
         logging.info("[%s] Wrote %s", label, out)
 
 
 # Overlay histograms for multiple gap settings (e.g., 5m/10m/20m) for a single time range.
-def save_combined_histograms(range_label: str, results_by_gap: Dict[int, "RangeResults"]) -> None:
+def save_combined_histograms(plots_dir: Path, range_label: str, results_by_gap: Dict[int, "RangeResults"]) -> None:
     """Create overlay histograms for multiple gap settings (e.g., 5m/10m/20m) for a single time range."""
+    plots_dir.mkdir(parents=True, exist_ok=True)
     # Session duration overlay
     cap_minutes = 200
     bins_dur = np.arange(0, cap_minutes + 5, 5)
@@ -545,8 +547,8 @@ def save_combined_histograms(range_label: str, results_by_gap: Dict[int, "RangeR
         plt.ylabel("Count")
         plt.xlim(0, cap_minutes)
         plt.legend(title="Session gap")
-        out = f"{range_label.replace(' ', '_').lower()}_session_duration_hist_all_gaps.png"
-        plt.savefig(out, dpi=160, bbox_inches="tight")
+        out = plots_dir / f"{range_label.replace(' ', '_').lower()}_session_duration_hist_all_gaps.png"
+        plt.savefig(str(out), dpi=160, bbox_inches="tight")
         logging.info("[%s] Wrote %s", range_label, out)
     plt.close()
 
@@ -571,8 +573,8 @@ def save_combined_histograms(range_label: str, results_by_gap: Dict[int, "RangeR
         plt.ylabel("Count")
         plt.xlim(0, cap_x)
         plt.legend(title="Session gap")
-        out = f"{range_label.replace(' ', '_').lower()}_sessions_per_week_hist_all_gaps.png"
-        plt.savefig(out, dpi=160, bbox_inches="tight")
+        out = plots_dir / f"{range_label.replace(' ', '_').lower()}_sessions_per_week_hist_all_gaps.png"
+        plt.savefig(str(out), dpi=160, bbox_inches="tight")
         logging.info("[%s] Wrote %s", range_label, out)
     plt.close()
 
@@ -749,6 +751,7 @@ def main():
             logging.warning("No October data found (checked preferred/current/previous year). Skipping October analysis.")
 
         out_dir = Path("stats output")
+        plots_dir = Path("charts output")
 
         for range_label, start, end in ranges:
             logging.info("---- Running analysis range: %s ----", range_label)
@@ -775,7 +778,7 @@ def main():
                 print_terminal_summary(results)
 
                 # Individual plots per gap
-                save_histograms(label, results.session_durations_active, results.sessions_per_active_week)
+                save_histograms(plots_dir, label, results.session_durations_active, results.sessions_per_active_week)
 
                 # Per-gap outputs (unique filenames because label includes gap)
                 write_excel(results, out_dir)
@@ -785,7 +788,7 @@ def main():
                 conn.commit()
 
             # Combined overlay plots for this time range
-            save_combined_histograms(range_label, results_by_gap)
+            save_combined_histograms(plots_dir, range_label, results_by_gap)
 
         logging.info("Done.")
     finally:
