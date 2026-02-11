@@ -306,6 +306,7 @@ class RangeResults:
     unique_users_total: int
     weekly_active_users_total: int
     active_user_weeks_total: int
+    total_sessions_total: int
     session_durations_active: List[float]
     sessions_per_active_week: List[int]
     active_user_week_rows: List[dict]
@@ -396,6 +397,7 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
     active_user_week_rows: List[dict] = []
     durations_active: List[float] = []
     sessions_per_active_week: List[int] = []
+    total_sessions_total = 0
 
     current_user = None
     session_start: Optional[datetime] = None
@@ -404,7 +406,7 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
     per_week_days: Dict[date, Set[int]] = {}
 
     def close_session():
-        nonlocal session_start, session_end, per_week
+        nonlocal session_start, session_end, per_week, total_sessions_total
         if session_start is None or session_end is None:
             return
         dur_min = max(0.0, (session_end - session_start).total_seconds() / 60.0)
@@ -415,6 +417,7 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
             agg = WeekAgg()
             per_week[wk] = agg
         agg.sessions += 1
+        total_sessions_total += 1
         agg.total_minutes += dur_min
         # agg.days_used.add(wd)  # REMOVE: don't track days_used here anymore
         agg.durations.append(dur_min)
@@ -514,8 +517,8 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
     pbar.close()
 
     logging.info(
-        "[%s] Unique users=%d | Weekly active users=%d | Active user-weeks=%d | Active sessions=%d",
-        label, len(unique_users), len(weekly_active_users), len(active_user_week_rows), len(durations_active)
+        "[%s] Unique users=%d | Weekly active users=%d | Active user-weeks=%d | Total sessions=%d | Active sessions=%d",
+        label, len(unique_users), len(weekly_active_users), len(active_user_week_rows), total_sessions_total, len(durations_active)
     )
 
     return RangeResults(
@@ -525,6 +528,7 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
         unique_users_total=len(unique_users),
         weekly_active_users_total=len(weekly_active_users),
         active_user_weeks_total=len(active_user_week_rows),
+        total_sessions_total=total_sessions_total,
         session_durations_active=durations_active,
         sessions_per_active_week=sessions_per_active_week,
         active_user_week_rows=active_user_week_rows,
@@ -566,6 +570,12 @@ METRIC_DEFINITIONS = [
         "definition": "Number of (user, week) pairs that meet the active-week rule.",
         "calculation": "Count of weeks per user where required weekdays are all present, summed across users.",
         "notes": "A single user can contribute multiple active weeks.",
+    },
+    {
+        "field_name": "total_sessions_total",
+        "definition": "Total number of sessions in the time range for all users (for this gap setting).",
+        "calculation": "Count of merged sessions across all users/weeks in the time range (Mon–Thu filter applied).",
+        "notes": "Independent of the weekly-active filter; depends on the gap because merging changes session counts.",
     },
     {
         "field_name": "active_sessions_total",
@@ -617,12 +627,14 @@ def summarize(
     sessions_per_week: List[int],
     unique_users_total: int,
     weekly_active_users_total: int,
+    total_sessions_total: int,
 ) -> dict:
     if not durations:
         return {
             "label": label,
             "unique_users_total": int(unique_users_total),
             "weekly_active_users_total": int(weekly_active_users_total),
+            "total_sessions_total": int(total_sessions_total),
             "active_sessions_total": 0,
             "mean_session_minutes": None,
             "median_session_minutes": None,
@@ -637,6 +649,7 @@ def summarize(
         "label": label,
         "unique_users_total": int(unique_users_total),
         "weekly_active_users_total": int(weekly_active_users_total),
+        "total_sessions_total": int(total_sessions_total),
         "active_sessions_total": int(d.size),
         "mean_session_minutes": float(np.mean(d)),
         "median_session_minutes": float(np.median(d)),
@@ -768,6 +781,7 @@ def write_combined_summaries_csv(rows: List[dict], out_dir: Path) -> Path:
             "unique_users_total",
             "weekly_active_users_total",
             "active_user_weeks_total",
+            "total_sessions_total",
             "active_sessions_total",
             "mean_session_minutes",
             "median_session_minutes",
@@ -802,6 +816,7 @@ def write_excel(results, out_dir: Path) -> Path:
         results.sessions_per_active_week,
         results.unique_users_total,
         results.weekly_active_users_total,
+        results.total_sessions_total,
     )
     df_summary = pd.DataFrame([{
         **summary_dict,
@@ -833,6 +848,7 @@ def write_summary_csv(results, out_dir: Path) -> Path:
         results.sessions_per_active_week,
         results.unique_users_total,
         results.weekly_active_users_total,
+        results.total_sessions_total,
     )
 
     df_summary = pd.DataFrame([{
@@ -893,11 +909,13 @@ def print_terminal_summary(results) -> None:
         results.sessions_per_active_week,
         results.unique_users_total,
         results.weekly_active_users_total,
+        results.total_sessions_total,
     )
     logging.info("======== SUMMARY (%s) ========", results.label)
     logging.info("UTC range: %s  ->  %s", results.start.isoformat(), results.end.isoformat())
     logging.info("Unique users (distinct): %s", s["unique_users_total"])
     logging.info("Weekly active users (distinct): %s", s["weekly_active_users_total"])
+    logging.info("Total sessions (all users): %s", s["total_sessions_total"])
     logging.info("Active sessions (total): %s", s["active_sessions_total"])
     logging.info("Mean session minutes: %s", None if s["mean_session_minutes"] is None else round(s["mean_session_minutes"], 3))
     logging.info("Median session minutes: %s", None if s["median_session_minutes"] is None else round(s["median_session_minutes"], 3))
@@ -1042,6 +1060,7 @@ def main():
                     results.sessions_per_active_week,
                     results.unique_users_total,
                     results.weekly_active_users_total,
+                    results.total_sessions_total,
                 )
                 combined_summary_rows.append({
                     "range_label": range_label,
