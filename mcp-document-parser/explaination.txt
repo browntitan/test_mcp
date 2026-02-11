@@ -1,0 +1,35 @@
+Our original session-duration calculation used the chat table as an “event stream” because the messages table is empty in our deployment. In our database, the chat table is essentially one row per chat thread, with created_at and updated_at stored as epoch timestamps (BIGINT), and a chat JSON blob that contains the conversation content/metadata. We don’t currently have a populated, normalized message table that stores one row per message with its own timestamp, so we can’t reliably compute “time in session” by looking at individual message send times.
+
+Because of that schema reality, the old approach treated each chat row as a single “event” at one timestamp (typically created_at). That meant many sessions contained only one event, producing lots of 0-minute sessions and driving the median session duration to 0 even when users were actively chatting.
+
+Example (old approach): what user activity looks like vs what we could measure
+
+What the user actually does (message-level activity we don’t have as rows):
+	•	09:00:10 user sends msg
+	•	09:01:05 user sends msg
+	•	09:03:30 user sends msg
+	•	09:09:50 user sends msg
+	•	09:12:00 user sends msg
+
+What the old metric pipeline effectively saw (chat-row “event”):
+	•	09:00:00 chat thread created (created_at)
+
+Old computed session duration:
+	•	09:00:00 – 09:00:00 = 0 minutes (even though the user was active until ~09:12)
+
+We updated the logic to treat each chat thread as an activity interval using created_at → updated_at, then merge intervals into sessions with 5/10/20-minute gap thresholds. This produces a more realistic estimate of engagement time by measuring the span from first activity to last update, which is the best reliable signal available given our current schema.
+
+Example (new approach): what we measure now
+
+What we see in the chat table (activity interval per thread):
+	•	09:00:00 chat thread created (created_at)
+	•	09:12:00 chat thread last modified (updated_at)
+
+New computed session duration (single thread):
+	•	09:00:00 – 09:12:00 = 12 minutes
+
+If the user touches multiple threads close together, we merge them into one session:
+	•	09:00:00–09:06:00 Chat A active interval
+	•	09:07:00–09:12:00 Chat B active interval
+	•	Gap between intervals = 1 minute → merged into one continuous session
+	•	New session duration = 09:00:00 – 09:12:00 = 12 minutes
