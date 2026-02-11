@@ -303,7 +303,8 @@ class RangeResults:
     label: str
     start: datetime
     end: datetime
-    active_users_total: int
+    unique_users_total: int
+    weekly_active_users_total: int
     active_user_weeks_total: int
     session_durations_active: List[float]
     sessions_per_active_week: List[int]
@@ -390,7 +391,8 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
 
     gap = timedelta(minutes=gap_minutes)
 
-    active_users: Set[str] = set()
+    unique_users: Set[str] = set()
+    weekly_active_users: Set[str] = set()
     active_user_week_rows: List[dict] = []
     durations_active: List[float] = []
     sessions_per_active_week: List[int] = []
@@ -420,7 +422,7 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
         session_end = None
 
     def finalize_user(user_id):
-        nonlocal per_week, per_week_days, active_users, active_user_week_rows, durations_active, sessions_per_active_week
+        nonlocal per_week, per_week_days, weekly_active_users, active_user_week_rows, durations_active, sessions_per_active_week
         if not per_week and not per_week_days:
             return
 
@@ -436,7 +438,7 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
             is_active_week = required_weekdays.issubset(days_used)
 
             if is_active_week:
-                active_users.add(str(user_id))
+                weekly_active_users.add(str(user_id))
                 durations_active.extend(agg.durations)
                 sessions_per_active_week.append(agg.sessions)
                 active_user_week_rows.append({
@@ -479,6 +481,7 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
     for user_id, start_ts, end_ts in stream_chat_intervals(conn, chat, plan, start, end, dow_list_pg, itersize=itersize):
         pbar.update(1)
         record_interval_days(start_ts, end_ts)
+        unique_users.add(str(user_id))
 
         if current_user is None:
             current_user = user_id
@@ -510,14 +513,17 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
 
     pbar.close()
 
-    logging.info("[%s] Active users=%d | Active user-weeks=%d | Active sessions=%d",
-                 label, len(active_users), len(active_user_week_rows), len(durations_active))
+    logging.info(
+        "[%s] Unique users=%d | Weekly active users=%d | Active user-weeks=%d | Active sessions=%d",
+        label, len(unique_users), len(weekly_active_users), len(active_user_week_rows), len(durations_active)
+    )
 
     return RangeResults(
         label=label,
         start=start,
         end=end,
-        active_users_total=len(active_users),
+        unique_users_total=len(unique_users),
+        weekly_active_users_total=len(weekly_active_users),
         active_user_weeks_total=len(active_user_week_rows),
         session_durations_active=durations_active,
         sessions_per_active_week=sessions_per_active_week,
@@ -529,11 +535,94 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
 # Outputs
 # ----------------------------
 
-def summarize(label: str, durations: List[float], sessions_per_week: List[int], active_users_total: int) -> dict:
+# Metric definitions for output data dictionary and self-documenting CSVs.
+METRIC_DEFINITIONS = [
+    {
+        "field_name": "range_label",
+        "definition": "The time window being analyzed (e.g., Last_30_Days, October_2025).",
+        "calculation": "Set by the script based on the chosen time range.",
+        "notes": "All analysis filters to Monday–Thursday activity only.",
+    },
+    {
+        "field_name": "gap_minutes",
+        "definition": "Session merge threshold in minutes (e.g., 5, 10, 20).",
+        "calculation": "Intervals are merged into the same session if next_start - current_end <= gap_minutes.",
+        "notes": "Smaller gap => more sessions; larger gap => fewer, longer sessions.",
+    },
+    {
+        "field_name": "unique_users_total",
+        "definition": "Distinct users with ANY activity in the time range (Mon–Thu only).",
+        "calculation": "COUNT(DISTINCT user_id) over streamed chat activity intervals in the time range.",
+        "notes": "This is the 'used the tool at least once' metric (within the Mon–Thu filter).",
+    },
+    {
+        "field_name": "weekly_active_users_total",
+        "definition": "Distinct users who have at least one 'active week' in the time range.",
+        "calculation": "User is counted if they have a week where required weekdays (default Mon–Thu) are all present in activity-days.",
+        "notes": "This is a stricter 'consistent usage / power user' metric.",
+    },
+    {
+        "field_name": "active_user_weeks_total",
+        "definition": "Number of (user, week) pairs that meet the active-week rule.",
+        "calculation": "Count of weeks per user where required weekdays are all present, summed across users.",
+        "notes": "A single user can contribute multiple active weeks.",
+    },
+    {
+        "field_name": "active_sessions_total",
+        "definition": "Total number of sessions among weekly-active user-weeks (for this gap setting).",
+        "calculation": "Count of merged sessions belonging to weeks that meet the active-week rule.",
+        "notes": "Sessions are built by merging chat intervals derived from created_at→updated_at.",
+    },
+    {
+        "field_name": "mean_session_minutes",
+        "definition": "Average session duration (minutes) among sessions in weekly-active weeks.",
+        "calculation": "Mean of (session_end - session_start) in minutes over sessions in active weeks.",
+        "notes": "Plots cap at 200 for readability, but stats are computed on uncapped durations.",
+    },
+    {
+        "field_name": "median_session_minutes",
+        "definition": "Median session duration (minutes) among sessions in weekly-active weeks.",
+        "calculation": "Median of (session_end - session_start) in minutes over sessions in active weeks.",
+        "notes": "",
+    },
+    {
+        "field_name": "mean_sessions_per_active_week",
+        "definition": "Average number of sessions per active user-week.",
+        "calculation": "Mean of weekly session counts across active user-weeks.",
+        "notes": "",
+    },
+    {
+        "field_name": "median_sessions_per_active_week",
+        "definition": "Median number of sessions per active user-week.",
+        "calculation": "Median of weekly session counts across active user-weeks.",
+        "notes": "",
+    },
+    {
+        "field_name": "range_start_utc",
+        "definition": "UTC start timestamp of the analyzed window.",
+        "calculation": "Set by script.",
+        "notes": "",
+    },
+    {
+        "field_name": "range_end_utc",
+        "definition": "UTC end timestamp of the analyzed window.",
+        "calculation": "Set by script.",
+        "notes": "",
+    },
+]
+
+def summarize(
+    label: str,
+    durations: List[float],
+    sessions_per_week: List[int],
+    unique_users_total: int,
+    weekly_active_users_total: int,
+) -> dict:
     if not durations:
         return {
             "label": label,
-            "active_users_total": active_users_total,
+            "unique_users_total": int(unique_users_total),
+            "weekly_active_users_total": int(weekly_active_users_total),
             "active_sessions_total": 0,
             "mean_session_minutes": None,
             "median_session_minutes": None,
@@ -546,7 +635,8 @@ def summarize(label: str, durations: List[float], sessions_per_week: List[int], 
 
     return {
         "label": label,
-        "active_users_total": int(active_users_total),
+        "unique_users_total": int(unique_users_total),
+        "weekly_active_users_total": int(weekly_active_users_total),
         "active_sessions_total": int(d.size),
         "mean_session_minutes": float(np.mean(d)),
         "median_session_minutes": float(np.median(d)),
@@ -675,7 +765,9 @@ def write_combined_summaries_csv(rows: List[dict], out_dir: Path) -> Path:
             "range_label",
             "gap_minutes",
             "label",
-            "active_users_total",
+            "unique_users_total",
+            "weekly_active_users_total",
+            "active_user_weeks_total",
             "active_sessions_total",
             "mean_session_minutes",
             "median_session_minutes",
@@ -691,6 +783,11 @@ def write_combined_summaries_csv(rows: List[dict], out_dir: Path) -> Path:
     df = pd.DataFrame(rows)
     df.to_csv(csv_path, index=False)
     logging.info("Wrote combined summary CSV: %s", csv_path)
+
+    # Also write a self-documenting version (all summary rows + definitions).
+    with_defs_path = out_dir / "openwebui_summary_all_ranges_all_gaps_with_definitions.csv"
+    write_summary_with_definitions_csv(rows, with_defs_path)
+
     return csv_path
 
 
@@ -703,10 +800,12 @@ def write_excel(results, out_dir: Path) -> Path:
         results.label,
         results.session_durations_active,
         results.sessions_per_active_week,
-        results.active_users_total,
+        results.unique_users_total,
+        results.weekly_active_users_total,
     )
     df_summary = pd.DataFrame([{
         **summary_dict,
+        "active_user_weeks_total": results.active_user_weeks_total,
         "range_start_utc": results.start.isoformat(),
         "range_end_utc": results.end.isoformat(),
     }])
@@ -732,18 +831,59 @@ def write_summary_csv(results, out_dir: Path) -> Path:
         results.label,
         results.session_durations_active,
         results.sessions_per_active_week,
-        results.active_users_total,
+        results.unique_users_total,
+        results.weekly_active_users_total,
     )
 
     df_summary = pd.DataFrame([{
         **summary_dict,
+        "active_user_weeks_total": results.active_user_weeks_total,
         "range_start_utc": results.start.isoformat(),
         "range_end_utc": results.end.isoformat(),
     }])
 
     df_summary.to_csv(csv_path, index=False)
     logging.info(f"[{results.label}] Wrote summary CSV: {csv_path}")
+
+    # Also write a self-documenting version (summary + definitions).
+    with_defs_path = out_dir / f"{results.label.replace(' ', '_').lower()}_openwebui_summary_with_definitions.csv"
+    write_summary_with_definitions_csv([df_summary.iloc[0].to_dict()], with_defs_path)
+
     return csv_path
+
+
+# ----------------------------
+# Metrics dictionary CSV and self-documenting CSV helpers
+# ----------------------------
+
+def write_metrics_dictionary_csv(out_dir: Path) -> Path:
+    """Write a standalone data dictionary CSV describing each metric field."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "metrics_dictionary.csv"
+    pd.DataFrame(METRIC_DEFINITIONS).to_csv(path, index=False)
+    logging.info("Wrote metrics dictionary CSV: %s", path)
+    return path
+
+
+def write_summary_with_definitions_csv(summary_rows: List[dict], out_path: Path) -> Path:
+    """Write a CSV containing both summary rows and metric definition rows."""
+    rows: List[dict] = []
+
+    for r in summary_rows:
+        rows.append({"row_type": "summary", **r})
+
+    for d in METRIC_DEFINITIONS:
+        rows.append({
+            "row_type": "definition",
+            "field_name": d["field_name"],
+            "field_definition": d["definition"],
+            "field_calculation": d.get("calculation", ""),
+            "field_notes": d.get("notes", ""),
+        })
+
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    logging.info("Wrote self-documenting CSV: %s", out_path)
+    return out_path
 
 
 def print_terminal_summary(results) -> None:
@@ -751,11 +891,13 @@ def print_terminal_summary(results) -> None:
         results.label,
         results.session_durations_active,
         results.sessions_per_active_week,
-        results.active_users_total,
+        results.unique_users_total,
+        results.weekly_active_users_total,
     )
     logging.info("======== SUMMARY (%s) ========", results.label)
     logging.info("UTC range: %s  ->  %s", results.start.isoformat(), results.end.isoformat())
-    logging.info("Active users (distinct): %s", s["active_users_total"])
+    logging.info("Unique users (distinct): %s", s["unique_users_total"])
+    logging.info("Weekly active users (distinct): %s", s["weekly_active_users_total"])
     logging.info("Active sessions (total): %s", s["active_sessions_total"])
     logging.info("Mean session minutes: %s", None if s["mean_session_minutes"] is None else round(s["mean_session_minutes"], 3))
     logging.info("Median session minutes: %s", None if s["median_session_minutes"] is None else round(s["median_session_minutes"], 3))
@@ -898,12 +1040,14 @@ def main():
                     results.label,
                     results.session_durations_active,
                     results.sessions_per_active_week,
-                    results.active_users_total,
+                    results.unique_users_total,
+                    results.weekly_active_users_total,
                 )
                 combined_summary_rows.append({
                     "range_label": range_label,
                     "gap_minutes": gap,
                     **summary_dict,
+                    "active_user_weeks_total": results.active_user_weeks_total,
                     "range_start_utc": results.start.isoformat(),
                     "range_end_utc": results.end.isoformat(),
                 })
@@ -924,6 +1068,7 @@ def main():
             save_combined_histograms(range_label, results_by_gap, plots_dir)
 
         write_combined_summaries_csv(combined_summary_rows, out_dir)
+        write_metrics_dictionary_csv(out_dir)
         logging.info("Done.")
     finally:
         try:
