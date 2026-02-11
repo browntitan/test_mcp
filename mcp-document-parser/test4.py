@@ -399,6 +399,7 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
     session_start: Optional[datetime] = None
     session_end: Optional[datetime] = None
     per_week: Dict[date, WeekAgg] = {}
+    per_week_days: Dict[date, Set[int]] = {}
 
     def close_session():
         nonlocal session_start, session_end, per_week
@@ -413,17 +414,27 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
             per_week[wk] = agg
         agg.sessions += 1
         agg.total_minutes += dur_min
-        agg.days_used.add(wd)
+        # agg.days_used.add(wd)  # REMOVE: don't track days_used here anymore
         agg.durations.append(dur_min)
         session_start = None
         session_end = None
 
     def finalize_user(user_id):
-        nonlocal per_week, active_users, active_user_week_rows, durations_active, sessions_per_active_week
-        if not per_week:
+        nonlocal per_week, per_week_days, active_users, active_user_week_rows, durations_active, sessions_per_active_week
+        if not per_week and not per_week_days:
             return
-        for wk_start, agg in per_week.items():
-            is_active_week = required_weekdays.issubset(agg.days_used)
+
+        # Consider weeks present in either sessions or activity-days.
+        all_weeks = set(per_week.keys()) | set(per_week_days.keys())
+
+        for wk_start in sorted(all_weeks):
+            agg = per_week.get(wk_start)
+            if agg is None:
+                agg = WeekAgg()
+
+            days_used = per_week_days.get(wk_start, set())
+            is_active_week = required_weekdays.issubset(days_used)
+
             if is_active_week:
                 active_users.add(str(user_id))
                 durations_active.extend(agg.durations)
@@ -434,15 +445,40 @@ def analyze_range(conn, chat: ChatSchema, plan: TimeColumnPlan, label: str,
                     "sessions": agg.sessions,
                     "total_session_minutes": round(agg.total_minutes, 3),
                     "avg_session_minutes": round((agg.total_minutes / agg.sessions) if agg.sessions else 0.0, 3),
-                    "days_used": ",".join(str(d) for d in sorted(agg.days_used)),
+                    "days_used": ",".join(str(d) for d in sorted(days_used)),
                     "active_week": True,
                 })
+
         per_week = {}
+        per_week_days = {}
+
+    def record_interval_days(start_ts: datetime, end_ts: datetime) -> None:
+        """Record the weekdays touched by this activity interval into per_week_days.
+
+        This is independent of session merging, so active-user counts remain consistent across gaps.
+        """
+        s_date = start_ts.date()
+        e_date = end_ts.date()
+
+        # Guard against pathological intervals; cap iteration to 10 days.
+        max_days = 10
+        days_span = (e_date - s_date).days
+        if days_span < 0:
+            days_span = 0
+        if days_span > max_days:
+            days_span = max_days
+
+        for i in range(days_span + 1):
+            d = s_date + timedelta(days=i)
+            wk = monday_of(datetime(d.year, d.month, d.day, tzinfo=timezone.utc))
+            wd = d.weekday()  # 0=Mon..6=Sun
+            per_week_days.setdefault(wk, set()).add(wd)
 
     pbar = tqdm(total=total_rows, desc=f"[{label}] streaming events", unit="rows")
 
     for user_id, start_ts, end_ts in stream_chat_intervals(conn, chat, plan, start, end, dow_list_pg, itersize=itersize):
         pbar.update(1)
+        record_interval_days(start_ts, end_ts)
 
         if current_user is None:
             current_user = user_id
