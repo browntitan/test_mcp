@@ -76,19 +76,11 @@ def connect() -> psycopg2.extensions.connection:
         kwargs["host"], kwargs["port"], kwargs["dbname"], kwargs["sslmode"], kwargs["user"]
     )
     conn = psycopg2.connect(**kwargs)
-
-    # IMPORTANT: psycopg2 named (server-side) cursors require an open transaction.
-    # autocommit=True disables transactions and will raise:
-    #   "can't use a named cursor outside of transactions"
-    conn.autocommit = False
-
+    conn.autocommit = True
     with conn.cursor() as cur:
         # Make weekday extraction stable
         cur.execute("SET TIME ZONE 'UTC';")
         cur.execute("SET statement_timeout = '0';")
-
-    # Commit session settings so we start analyses with a clean transaction state.
-    conn.commit()
     return conn
 
 
@@ -480,12 +472,20 @@ def summarize(label: str, durations: List[float], sessions_per_week: List[int], 
 def save_histograms(label: str, durations: List[float], sessions_per_week: List[int]) -> None:
     if durations:
         d = np.array(durations, dtype=float)
-        bins = list(np.arange(0, 181, 5)) + [240, 360, 480, 720, 1440]
+
+        # Cap duration histogram at 200 minutes.
+        cap_minutes = 200
+        d_cap = np.clip(d, 0, cap_minutes)
+
+        # 5-minute bins up to 200.
+        bins = np.arange(0, cap_minutes + 5, 5)
+
         plt.figure()
-        plt.hist(np.clip(d, 0, 1440), bins=bins)
+        plt.hist(d_cap, bins=bins)
         plt.title(f"Session Duration (minutes) — {label} (Active User-Weeks)")
-        plt.xlabel("Session duration (minutes)")
+        plt.xlabel(f"Session duration (minutes, capped at {cap_minutes})")
         plt.ylabel("Count")
+        plt.xlim(0, cap_minutes)
         out = f"{label.replace(' ', '_').lower()}_session_duration_hist.png"
         plt.savefig(out, dpi=160, bbox_inches="tight")
         plt.close()
@@ -493,13 +493,20 @@ def save_histograms(label: str, durations: List[float], sessions_per_week: List[
 
     if sessions_per_week:
         spw = np.array(sessions_per_week, dtype=int)
-        max_bin = max(10, int(np.max(spw)) + 2)
-        bins = np.arange(0, max_bin + 1, 1)
+
+        # Cap x-axis at 200 for consistency with duration chart.
+        cap_x = 200
+        spw_cap = np.clip(spw, 0, cap_x)
+
+        # Integer bins from 0..200.
+        bins = np.arange(0, cap_x + 2, 1)
+
         plt.figure()
-        plt.hist(spw, bins=bins, align="left")
+        plt.hist(spw_cap, bins=bins, align="left")
         plt.title(f"Sessions per Week — {label} (Active User-Weeks)")
-        plt.xlabel("Sessions in week")
+        plt.xlabel(f"Sessions in week (capped at {cap_x})")
         plt.ylabel("Count")
+        plt.xlim(0, cap_x)
         out = f"{label.replace(' ', '_').lower()}_sessions_per_week_hist.png"
         plt.savefig(out, dpi=160, bbox_inches="tight")
         plt.close()
@@ -529,6 +536,33 @@ def write_excel(results, out_dir: Path) -> Path:
 
     logging.info("[%s] Wrote Excel: %s", results.label, str(xlsx_path))
     return xlsx_path
+
+
+# ----------------------------
+# CSV summary output
+# ----------------------------
+
+def write_summary_csv(results, out_dir: Path) -> Path:
+    """Write a one-row CSV containing summary stats for the given range."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / f"{results.label.replace(' ', '_').lower()}_openwebui_summary.csv"
+
+    summary_dict = summarize(
+        results.label,
+        results.session_durations_active,
+        results.sessions_per_active_week,
+        results.active_users_total,
+    )
+
+    df_summary = pd.DataFrame([{
+        **summary_dict,
+        "range_start_utc": results.start.isoformat(),
+        "range_end_utc": results.end.isoformat(),
+    }])
+
+    df_summary.to_csv(csv_path, index=False)
+    logging.info(f"[{results.label}] Wrote summary CSV: {csv_path}")
+    return csv_path
 
 
 def print_terminal_summary(results) -> None:
@@ -657,15 +691,10 @@ def main():
             print_terminal_summary(results)
             save_histograms(label, results.session_durations_active, results.sessions_per_active_week)
             write_excel(results, out_dir)
-            # Close the transaction used by the server-side cursor and release resources.
-            conn.commit()
+            write_summary_csv(results, out_dir)
 
         logging.info("Done.")
     finally:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
         conn.close()
 
 
