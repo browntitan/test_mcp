@@ -283,8 +283,148 @@ D) Active user-weeks (core consistency volume)
 
 🟦 Meaning: October had more active weeks among core users, even with fewer overall users. This suggests October’s weekly-actives were “active” in more distinct weeks.
 
+Below are manager-friendly answers to items 4–6. I’ll keep them very concrete and tie them directly to how the script actually works today.
+
 ⸻
 
-If you want one “tight” response to your manager:
+4) “Does this ignore chats/threads that were started outside of the time period of interest?”
 
-🟦 I can also rewrite the above into a short paragraph-per-question format suitable for email/Slack—tell me what tone you want (formal vs casual).
+Yes — with an important caveat.
+
+What the code does today
+
+We filter rows using created_at (the start timestamp) to be within the time range:
+	•	We select intervals where created_at is between [start, end).
+	•	Then we use updated_at as the interval end.
+
+Implication
+	•	If a chat thread was created before the time window but updated during the window, we currently exclude it (because its created_at is outside the window), even though the user may have actively used it during the period.
+
+Why this matters
+
+This will under-count activity for users who tend to reuse older threads (which is common behavior).
+
+Recommendation (if you want “activity within window”)
+
+Change the filtering logic from “created within window” to “overlaps window,” i.e.:
+	•	include a chat interval if updated_at >= start AND created_at < end
+
+That way any thread that was active during the window is included, even if it started earlier.
+
+⸻
+
+5) “Why is messages vs chat tables like this? Env var? Distributed deployment?”
+
+Most likely it’s not an environment variable you set for analytics — it’s a product/storage design choice + how your deployment persists data. There are a few common reasons you’d see messages empty while chat is populated:
+	1.	OpenWebUI stores conversation content in the chat table’s JSON column (your schema shows chat : json).
+In that model, a separate messages table may exist but not be actively used.
+	2.	Migration/version differences
+Depending on OpenWebUI version and database migrations, older deployments may have different persistence patterns (e.g., everything in chat JSON vs normalized tables).
+	3.	Deployment/persistence settings
+If parts of the stack run with ephemeral storage, or you have multiple app instances and only one is writing a given table, you can see partial patterns — but given that chat is heavily populated, the system is persisting data somewhere, just not to messages.
+
+How to confirm quickly (low effort)
+	•	Inspect the chat JSON field for messages/timestamps structure.
+	•	Check OpenWebUI version + migrations on your deployment.
+	•	Search OpenWebUI config/env for storage mode or DB migration flags (if any), but I’d bet this is primarily schema usage, not a knob you set.
+
+⸻
+
+6) “I’m reading this as active users use the tool between 6 and 20 minutes/week based on the medians.”
+
+That interpretation is directionally plausible, but it’s not a clean ‘minutes per week’ metric given how we’re measuring.
+
+Why “median session minutes” ≠ “time spent using the tool”
+
+Our session minutes are derived from thread lifespans (updated_at - created_at) merged into sessions, not from “time user was actively typing/reading.”
+
+So a user could:
+	•	ask a question in 30 seconds,
+	•	spend an hour thinking/working offline,
+	•	come back later and send another message, and updated_at jumps.
+
+That can produce long “session spans” that are not real “time-on-screen.”
+
+Better way to approximate “minutes per active week”
+
+If you want a weekly figure, use:
+	•	median sessions per active week × median session minutes
+
+For example, Last 30 days:
+	•	median sessions/week ≈ 3
+	•	median session minutes ≈ 1.8 to 6.2 (depending on gap)
+→ rough “typical weekly engagement span proxy” ≈ 5.4 to 18.6 minutes
+
+So your manager’s “6–20 minutes” framing is roughly consistent with the medians, but we should label it as “proxy engagement span,” not true time spent.
+
+⸻
+
+6a) “Most people are using this as a glorified search engine”
+
+Possibly, but the data alone can’t prove intent.
+What the data does support is: many users have short, discrete sessions (median session minutes are low), and median sessions per week is only 2–3 among weekly actives. That pattern is consistent with “quick lookup” usage, but it could also be:
+	•	quick drafting/rewriting
+	•	one-off policy checks
+	•	occasional Q&A support
+
+You’d need UI telemetry or message counts to confirm “search-engine-like” behavior.
+
+6a(i) “Median is low because we have many 0s from single-query threads that never get updated. Accurate?”
+Less accurate now than it was before.
+Under the old method (single timestamp events), zeros were extremely common.
+
+Under the new method, a thread that truly “never gets updated” means:
+	•	updated_at == created_at → interval length 0
+That can still happen (e.g., thread created but not used, or created+updated in same second), but given your current medians are ~1.7–6.9 minutes, it suggests that 0s are not dominating the weekly-active population anymore.
+
+That said: 0-length intervals probably still exist, especially for casual/one-time users outside the weekly-active cohort.
+
+6a(ii) “If we ignore session minutes of 0, how does the median change?”
+Likely not much for the weekly-active cohort (because your medians aren’t near 0 anymore), but it could matter a lot for the “all users” population.
+
+Actionable suggestion: add two stats to the script:
+	•	% of sessions with duration == 0
+	•	median session minutes excluding zeros
+
+That would directly answer this question with numbers.
+
+And yes: your manager is right that even a non-zero median still isn’t perfect for “value,” because value can be high even in short sessions (one good answer can save hours).
+
+⸻
+
+6b) “Not enough capability/awareness of capability”
+
+Plausible and consistent with the adoption-vs-core split.
+You’ve got:
+	•	lots of unique users (broad reach)
+	•	a much smaller weekly-active set (core)
+
+That often indicates people try it, but don’t adopt it as part of their weekly routine—often due to awareness, trust, or unclear use cases.
+
+A good next metric to validate this:
+	•	“Repeat usage rate”: % of unique users who return the following week
+	•	“Sessions per unique user” (we can now compute this using total_sessions_total / unique_users_total)
+
+⸻
+
+6c) “Not integrated into daily workflows leading to limited general usage”
+
+Also plausible.
+The fact that the core population is relatively stable while unique users fluctuate suggests:
+	•	core users have already integrated it
+	•	many others are “touring” it rather than embedding it into daily work
+
+If you want to push this from plausible → evidence-based, track:
+	•	weekly cohorts: new users → week+1 return rate
+	•	segmentation by org/team (if you have it)
+	•	integration triggers (e.g., links from internal portals, SOPs, onboarding)
+
+⸻
+
+Bottom line (the honest takeaway to share)
+	•	Yes, the current query likely excludes older threads reused during the window (we can fix that with an overlap filter).
+	•	Messages vs chat table is likely schema usage/design + version/migration, not a knob you intentionally set.
+	•	The “minutes per week” medians are a proxy engagement span, not true time-on-task.
+	•	The data strongly supports: short typical sessions + a smaller consistent user core, which is consistent with “quick lookup” usage but not definitive proof of intent.
+
+If you want, I can also draft a clean “reply email” version where your manager’s bullets are quoted and your answers are inserted underneath in a different color/style.
