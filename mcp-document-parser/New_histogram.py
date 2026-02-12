@@ -10,7 +10,7 @@ Key definitions:
 - We include ONLY Monday–Thursday events. Friday/weekend are excluded.
 
 Outputs:
-- hist_output_data_messagelevel/
+- new_hist_outputs/
   - summary_messagelevel.csv
   - active_user_weeks_messagelevel.csv
   - histograms (all users + active users, per time range)
@@ -67,7 +67,7 @@ INCLUDED_WEEKDAYS = {0, 1, 2, 3}  # Mon-Thu
 SESSION_GAP_MINUTES = 10
 
 # Output directory
-OUT_DIR = Path("hist_output_data_messagelevel")
+OUT_DIR = Path("new_hist_outputs")
 
 
 # ----------------------------
