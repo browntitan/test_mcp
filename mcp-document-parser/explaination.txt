@@ -169,3 +169,122 @@ How to interpret this responsibly:
 	•	p90 / p95 session duration
 	•	winsorized/capped mean (e.g., cap session duration at 60 or 120 minutes for the average)
 
+
+
+
+_______________________________
+Below is a manager-friendly set of answers to each question. I’ll put my responses in 🟦 BLUE (using the blue square) so you can paste this directly into your doc/email.
+
+⸻
+
+1) “By session do we essentially mean thread? (I’m assuming merges across threads are minimal?)”
+
+🟦 Answer: A session is not the same as a chat thread in our code.
+	•	A chat thread = one row in the chat table. We treat each thread as an activity interval: [created_at → updated_at].
+	•	A session = a continuous usage window for a single user, formed by merging one or more thread-intervals when they’re close in time (within the gap: 5/10/20 minutes).
+
+🟦 What that means practically:
+	•	If a user only interacts with one thread and then stops, that often becomes one session ≈ one thread.
+	•	If a user bounces between threads or updates multiple threads close together, those thread-intervals can merge into one session (especially at 10m or 20m gap).
+So the “session ≈ thread” assumption is sometimes true, but not guaranteed.
+
+🟦 How we can tell whether merging is minimal or significant:
+The fact that median session minutes increases a lot when gap increases is a signal that merging/bridging is happening (either within a thread over short pauses, or across threads close together). If merges were truly rare, changing gap wouldn’t move median duration much.
+
+1a) “Median session minutes triples while the median number of sessions stays constant—what does that imply?”
+
+🟦 Answer: That pattern is exactly what we’d expect when a larger gap merges short breaks into the same session, making each session longer, without collapsing separate “work bursts” into fewer sessions.
+	•	Median sessions/week stays constant → users still have roughly the same number of distinct work bursts per week.
+	•	Median session minutes increases → within each burst, the user may pause briefly (or switch threads), and the larger gap treats that as the same session.
+
+🟦 Interpretation using your numbers (Last 30 days):
+	•	Median sessions per active week stays at 3 (5m/10m/20m)
+	•	Median session minutes increases from ~1.78 → ~4.43 → ~6.17
+So: users are still doing ~3 bursts/week, but we’re grouping those bursts more aggressively as we increase the gap.
+
+⸻
+
+2) “The mean and median session minutes are crazy different.”
+
+🟦 Answer: Yes—this is a strong sign of a highly skewed distribution (a long tail of very large session durations). The median reflects “typical behavior,” while the mean is being pulled up by a smaller number of extremely long sessions.
+
+🟦 Why the long tail happens in our specific approach:
+We define a thread interval as created_at → updated_at. If a thread is created and then updated much later, it creates a very long interval—even if the user wasn’t continuously engaged that whole time. When those long intervals are included in sessions, they can create sessions measured in hours/days, which inflates the mean dramatically.
+
+2a) “Is this due to folks who only use one chat over and over?”
+
+🟦 Partly, yes, but it’s broader than that. “Reusing the same thread” can definitely create large updated_at - created_at spans. But even without thread reuse, any workflow where a thread is created and then updated much later can produce long spans.
+So: thread reuse is one plausible contributor, but the bigger truth is: updated_at - created_at measures “thread lifespan,” not guaranteed continuous attention. That’s why the mean can look huge.
+
+🟦 Practical guidance: Treat median session minutes as the “typical session length proxy.” Treat the mean as “there exist long-lived sessions/threads,” not as typical engagement.
+
+⸻
+
+3) “Are session minutes aggregated across the entire time to reach mean/median?”
+
+🟦 Answer: Yes. The mean/median session minutes are computed across all sessions (for the selected population) in that time window.
+Each session contributes one duration value, and then we take mean/median across the whole set.
+
+🟦 Important nuance: In your current outputs, mean_session_minutes / median_session_minutes are computed for sessions in weekly-active weeks (the “core” cohort), not for every user. That’s why you also have:
+	•	total_sessions_total (all users)
+	•	active_sessions_total (only weekly-active weeks)
+
+3a) “If someone starts a chat 10/1 and updates 10/31—are they counted as active each week?”
+
+🟦 Answer: Under our current approximation, a long thread interval can inflate “active days/weeks” more than we’d ideally want—because we record “days touched” by the interval.
+However, we also have a guardrail: we cap the day-walk at 10 days for any single interval to avoid runaway counting.
+
+So in your example (10/1 → 10/31):
+	•	We would not count activity for every day/week in October, because we cap how many days we infer from one interval.
+	•	But it could still count multiple weekdays (and possibly more than one week) even if actual activity only occurred on 10/1 and 10/31.
+
+🟦 Interpretation: This is a limitation of using created_at → updated_at as a proxy for “days active.” Without message-level timestamps, we cannot perfectly know which days inside that span had real interaction.
+
+3b) “Are session minutes only for active users/active weeks?”
+
+🟦 Answer: Yes, for the session-minute stats currently shown:
+	•	mean_session_minutes, median_session_minutes, mean_sessions_per_active_week, median_sessions_per_active_week, and active_sessions_total are tied to weekly-active weeks.
+	•	total_sessions_total is the counter you asked us to add that covers all sessions for all users, independent of weekly-active status.
+
+⸻
+
+Quick interpretation of your specific outputs (what stands out)
+
+Using the table you shared:
+
+A) Adoption (unique users)
+	•	Last 30 Days: ~13,373 unique users
+	•	October 2025: ~9,757 unique users
+🟦 Meaning: more people tried/used OpenWebUI in the last 30 days than in October (workdays only).
+
+B) Core user base (weekly active users)
+	•	Last 30 Days: 2,422 weekly active users
+	•	October 2025: 2,426 weekly active users
+🟦 Meaning: the core consistent user base is basically flat between the two periods, even though overall unique users changed a lot.
+
+🟦 Key takeaway: growth in last 30 days seems to be coming more from occasional users, not growth in the core weekly-active population.
+
+C) Total sessions vs active sessions
+
+Last 30 Days:
+	•	total_sessions_total: 81,067 → 76,154 → 73,196 (5m→10m→20m)
+	•	active_sessions_total: 17,042 → 14,607 → 13,584
+
+October:
+	•	total_sessions_total: 57,519 → 52,824 → 51,014
+	•	active_sessions_total: 16,072 → 12,718 → 11,987
+
+🟦 Meaning: most sessions are generated by the broader population (total sessions), while a smaller fraction comes from weekly-active weeks (active sessions).
+You can use active_sessions_total / total_sessions_total as “share of sessions attributable to core cohort.”
+
+D) Active user-weeks (core consistency volume)
+	•	Last 30 Days: active_user_weeks_total = 3,575
+	•	October 2025: active_user_weeks_total = 3,960
+
+🟦 Meaning: October had more active weeks among core users, even with fewer overall users. This suggests October’s weekly-actives were “active” in more distinct weeks.
+
+⸻
+
+If you want one “tight” response to your manager:
+
+🟦 I can also rewrite the above into a short paragraph-per-question format suitable for email/Slack—tell me what tone you want (formal vs casual).
